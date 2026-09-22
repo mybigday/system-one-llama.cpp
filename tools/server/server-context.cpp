@@ -3226,8 +3226,14 @@ private:
                             return;
                         }
 
-                        // TODO: support memory-less logits computation
-                        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
+                        // Generating needs a KV cache; reading a distribution out of one
+                        // forward pass does not. Encoder and diffusion architectures have no
+                        // memory at all (llama_model::create_memory returns nullptr), and
+                        // llama_decode routes them to encode(), which honours the per-token
+                        // output flags a System One request sets.
+                        // TODO: support memory-less logits computation for the generating paths
+                        if (slot.task->need_logits() && !llama_get_memory(ctx_tgt) &&
+                                slot.task->type != SERVER_TASK_TYPE_SYSTEM_ONE) {
                             send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
                             slot.release();
                             return;
@@ -3266,7 +3272,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && llama_get_memory(ctx_tgt)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3692,8 +3698,13 @@ private:
                         }
                     }
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    // no cache: no positions to track and nothing to checkpoint
+                    const bool has_memory = llama_get_memory(ctx_tgt) != nullptr;
+
+                    const auto pos_min = has_memory ? llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) : 0;
+                    const auto pos_max = has_memory ? llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) : 0;
+
+                    do_checkpoint = do_checkpoint && has_memory;
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
