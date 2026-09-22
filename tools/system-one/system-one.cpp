@@ -314,6 +314,102 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
     return std::find(out.begin(), out.end(), -1) == out.end();
 }
 
+// ---------------------------------------------------------------- planning
+
+bool build_plan(const so_config & cfg,
+                const llama_vocab * vocab,
+                const std::string & state,
+                const std::vector<question> & qs,
+                plan & out,
+                std::string & err) {
+    out = plan();
+    if (qs.empty()) {
+        err = "a request needs at least one question";
+        return false;
+    }
+
+    for (const auto & q : qs) {
+        if (q.options.size() < 2) {
+            err = "every question needs at least two options";
+            return false;
+        }
+        out.n_options.push_back((int) q.options.size());
+    }
+
+    if (cfg.ranked()) {
+        // the head scores a whole sequence, so each option gets one of its own
+        out.rank_pooling = true;
+        out.prefix_reuse = false;   // the sequences differ from the first token onwards
+
+        for (size_t qi = 0; qi < qs.size(); qi++) {
+            for (size_t oi = 0; oi < qs[qi].options.size(); oi++) {
+                std::vector<std::string> segments;
+                if (!render_pair_segments(cfg, state, qs[qi], oi, segments, err)) return false;
+
+                plan::sequence seq;
+                if (!tokenize_segments(vocab, cfg, segments, 0, seq.tok, err)) return false;
+                seq.question = qi;
+                seq.option   = oi;
+                out.sequences.push_back(std::move(seq));
+            }
+        }
+        return true;
+    }
+
+    // a slot readout answers every question from one sequence
+    if (!label_tokens(vocab, cfg.labels, out.labels)) {
+        err = "a label in system_one.labels is not a single token for this tokenizer";
+        return false;
+    }
+    for (const auto & q : qs) {
+        if (q.options.size() > cfg.labels.size()) {
+            err = "a question has " + std::to_string(q.options.size()) + " options but this "
+                  "readout has only " + std::to_string(cfg.labels.size()) + " labels; a model "
+                  "with a scoring head (system_one.readout = rank_head) has no such limit";
+            return false;
+        }
+    }
+
+    std::vector<std::string> segments;
+    if (!render_segments(cfg, state, qs, segments, err)) return false;
+
+    plan::sequence seq;
+    if (!tokenize_segments(vocab, cfg, segments, qs.size(), seq.tok, err)) return false;
+    out.sequences.push_back(std::move(seq));
+
+    // a bidirectional readout reads from inside the canvas, so no prefix survives a change
+    out.prefix_reuse = !cfg.masked();
+    return true;
+}
+
+bool answers_from_scores(const plan & p, const std::vector<float> & scores,
+                         std::vector<answer> & out, std::string & err) {
+    if (scores.size() != p.sequences.size()) {
+        err = "expected one score per planned sequence";
+        return false;
+    }
+
+    out.assign(p.n_options.size(), answer());
+    std::vector<std::vector<float>> per_question(p.n_options.size());
+    for (size_t i = 0; i < p.sequences.size(); i++) {
+        const auto & seq = p.sequences[i];
+        if (seq.question >= per_question.size()) {
+            err = "a planned sequence refers to a question that is not in the request";
+            return false;
+        }
+        per_question[seq.question].push_back(scores[i]);
+    }
+
+    for (size_t qi = 0; qi < per_question.size(); qi++) {
+        if ((int) per_question[qi].size() != p.n_options[qi]) {
+            err = "a question did not get one score per option";
+            return false;
+        }
+        out[qi] = answer_from_scores(per_question[qi]);
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------- readout
 
 static std::vector<float> softmax(const std::vector<float> & x) {

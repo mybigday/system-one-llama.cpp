@@ -90,6 +90,31 @@ struct tokenized {
     std::vector<int>         slots;   // one per question: position of its "(" token
 };
 
+// What a request turns into before anything is evaluated: which sequences to run, where the
+// answers are in them, and what the numbers coming back mean. Every decision that depends on
+// the readout is made here, so a caller only has to run sequences and hand the numbers back.
+struct plan {
+    struct sequence {
+        tokenized tok;              // ids, and the answer slots when the readout has any
+        size_t    question = 0;     // rank_head: the question this sequence scores
+        size_t    option   = 0;     // rank_head: the option it scores
+    };
+
+    std::vector<sequence>    sequences;
+    std::vector<int>         n_options;    // per question, in request order
+    std::vector<llama_token> labels;       // label token ids; empty for rank_head
+
+    bool rank_pooling = false;  // sequences are scored by the model's head, not read at a slot
+    bool prefix_reuse = true;   // false when attention is bidirectional: nothing is reusable
+};
+
+bool build_plan(const so_config & cfg,
+                const llama_vocab * vocab,
+                const std::string & state,
+                const std::vector<question> & qs,
+                plan & out,
+                std::string & err);
+
 // One BOS (when the model asks for it), then every segment with add_special = false.
 bool tokenize_segments(const llama_vocab * vocab,
                        const so_config & cfg,
@@ -124,6 +149,10 @@ float score_expectation(const answer & a);
 // Softmax over one question's option scores, with the same confidence measure the slot
 // readouts report. The scores come from the model's classification head, one per sequence.
 answer answer_from_scores(const std::vector<float> & scores);
+
+// Assemble a request's answers from one score per planned sequence, in plan order.
+bool answers_from_scores(const plan & p, const std::vector<float> & scores,
+                         std::vector<answer> & out, std::string & err);
 
 // One llama_decode over `t.ids`, then the label logits at every slot.
 bool read_slots(llama_context * ctx,
