@@ -33,7 +33,11 @@ SCHEMA: dict[str, str] = {
                                               # defaults to U+001E when absent
 }
 
-REQUIRED = ("system_one.readout",)
+# Nothing is required: the readout is derived from the model's own capabilities (a
+# classification head means rank_head, a bidirectional model means masked_slot, otherwise
+# letter_slot), and labels and segment_separator override their defaults. A template still has
+# to be there, but it is a named chat template rather than a system_one.* key.
+REQUIRED: tuple[str, ...] = ()
 
 _ESCAPES = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[nrt0\\])")
 

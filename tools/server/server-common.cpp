@@ -543,18 +543,17 @@ void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
 
 void server_tokens::push_back(server_tokens & tokens) {
     size_t start_idx = size();
-    for (size_t i = 0; i < tokens.size(); i++) {
-        push_back(tokens[i]);
-    }
     if (tokens.has_mtmd) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
-            mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-            map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
-        }
+    }
+    // copy the token list wholesale rather than one push_back at a time: the positions a media
+    // chunk occupies are LLAMA_TOKEN_NULL placeholders, which push_back(llama_token) rejects
+    this->tokens.insert(this->tokens.end(), tokens.tokens.begin(), tokens.tokens.end());
+    for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ++it) {
+        mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(it->second.get()));
+        map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
     }
 }
 
@@ -932,7 +931,8 @@ server_tokens process_mtmd_prompt(
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
-        bool is_placeholder) {
+        bool is_placeholder,
+        bool add_special) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
@@ -952,7 +952,7 @@ server_tokens process_mtmd_prompt(
     mtmd_input_text inp_txt = {
         prompt.data(),
         prompt.size(),
-        /* add_special */   true,
+        /* add_special */   add_special,
         /* parse_special */ true,
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
@@ -1076,7 +1076,7 @@ json oaicompat_completion_params_parse(const json & body) {
 // - file:// for local files (only allowed if media_path is set)
 // - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
 // - raw base64 encoded data
-static void handle_media(
+void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
         const std::string & media_path) {

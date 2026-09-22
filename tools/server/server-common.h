@@ -270,6 +270,16 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// load one media item into out_files. url can be
+// - http(s):// for remote files
+// - file:// for local files (only allowed if media_path is set)
+// - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
+// - raw base64 encoded data
+void handle_media(
+        std::vector<raw_buffer> & out_files,
+        const std::string & url,
+        const std::string & media_path);
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
 server_tokens process_mtmd_prompt(
@@ -277,7 +287,10 @@ server_tokens process_mtmd_prompt(
                                         const std::string & prompt,
                                         const std::vector<raw_buffer> & files,
                                         const mtmd_helper_init_opt & init_opt,
-                                        bool is_placeholder = false);
+                                        bool is_placeholder = false,
+                                        // false when the caller writes its own BOS, e.g. when
+                                        // the prompt is assembled from separately encoded parts
+                                        bool add_special = true);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them

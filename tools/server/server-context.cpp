@@ -5398,19 +5398,59 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // the state reaches the template as a string; an object is passed through as JSON
+        // the state reaches the template as a string; an object is passed through as JSON, and
+        // content parts become text with a media marker per image or clip
         std::string state;
+        std::vector<raw_buffer> state_files;
         if (body.contains("state")) {
-            const json & st = body.at("state");
-        if (st.is_array()) {
-            // reserved for OpenAI-style content parts carrying media; dumping the array into
-            // the prompt as JSON text would be a silently wrong answer, so refuse instead
-            res->error(format_error_response(
-                "\"state\" as a list of content parts is not supported yet -- pass a string or an object",
-                ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-            state = st.is_string() ? st.get<std::string>() : st.dump();
+const json & st = body.at("state");
+
+            if (st.is_array()) {
+                // OpenAI-style content parts. The text lands in the state with a media marker
+                // where each image or clip goes; mtmd splits on those markers when the state is
+                // tokenized, so the template never learns that any of this happened.
+                if (ctx_server.mctx == nullptr) {
+                    res->error(format_error_response(
+                        "this server has no multimodal projector -- start it with --mmproj to send media in \"state\"",
+                        ERROR_TYPE_NOT_SUPPORTED));
+                    return res;
+                }
+                for (const auto & part : st) {
+                    const std::string type = json_value(part, "type", std::string());
+                    try {
+                        if (type == "text") {
+                            state += json_value(part, "text", std::string());
+                        } else if (type == "image_url") {
+                            if (!meta->chat_params.allow_image) {
+                                res->error(format_error_response("this model does not support images", ERROR_TYPE_NOT_SUPPORTED));
+                                return res;
+                            }
+                            const json & iu = part.at("image_url");
+                            const std::string url = iu.is_string() ? iu.get<std::string>() : iu.at("url").get<std::string>();
+                            handle_media(state_files, url, meta->chat_params.media_path);
+                            state += get_media_marker();
+                        } else if (type == "input_audio") {
+                            if (!meta->chat_params.allow_audio) {
+                                res->error(format_error_response("this model does not support audio", ERROR_TYPE_NOT_SUPPORTED));
+                                return res;
+                            }
+                            const json & ia = part.at("input_audio");
+                            const std::string fmt  = json_value(ia, "format", std::string("wav"));
+                            const std::string data = ia.at("data").get<std::string>();
+                            handle_media(state_files, "data:audio/" + fmt + ";base64," + data, meta->chat_params.media_path);
+                            state += get_media_marker();
+                        } else {
+                            res->error(format_error_response("unknown content part type \"" + type + "\" in \"state\"", ERROR_TYPE_INVALID_REQUEST));
+                            return res;
+                        }
+                    } catch (const std::exception & e) {
+                        res->error(format_error_response(std::string("bad content part in \"state\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                }
+            } else {
+                state = st.is_string() ? st.get<std::string>() : st.dump();
+            }
         }
 
         std::vector<std::string>              keys;
@@ -5476,6 +5516,76 @@ void server_routes::init_routes() {
             return res;
         }
 
+        // With media in the state the tokenizing has to happen here, where the mtmd context
+        // is, so the request is rendered first and turned into tokens second. The question
+        // segments stay text either way and their slots are placed by the library, against
+        // however many positions the state ended up occupying.
+        server_tokens media_tokens;
+        std::vector<int> media_slots;
+
+        if (!state_files.empty()) {
+            system_one::layout lay;
+            if (!system_one::build_layout(cfg, ctx_server.vocab, state, questions, lay, err)) {
+                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (lay.rank_pooling) {
+                res->error(format_error_response(
+                    "media in \"state\" is not supported for a classification-head model: each option "
+                    "is its own sequence, so the media would be encoded once per option",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            const auto & ls = lay.sequences.front();
+            const size_t first_question = ls.segments.size() - ls.n_question_segments;
+            const std::string marker = get_media_marker();
+
+            media_tokens = server_tokens({}, true);
+
+            // Each state segment is tokenized on its own -- joining them first would merge
+            // tokens across the seams, which is the drift the segment rule exists to avoid --
+            // and each gets exactly the media its own markers call for.
+            size_t next_file = 0;
+            for (size_t i = 0; i < first_question; i++) {
+                const std::string & seg = ls.segments[i];
+
+                size_t n_markers = 0;
+                for (size_t at = seg.find(marker); at != std::string::npos; at = seg.find(marker, at + marker.size())) {
+                    n_markers++;
+                }
+                if (next_file + n_markers > state_files.size()) {
+                    res->error(format_error_response("more media markers than media were given", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                const std::vector<raw_buffer> seg_files(state_files.begin() + next_file,
+                                                        state_files.begin() + next_file + n_markers);
+                next_file += n_markers;
+
+                try {
+                    server_tokens seg_tokens = process_mtmd_prompt(ctx_server.mctx, seg, seg_files, ctx_server.init_opt,
+                                                                   /* is_placeholder */ false, /* add_special */ false);
+                    media_tokens.push_back(seg_tokens);
+                } catch (const std::exception & e) {
+                    res->error(format_error_response(std::string("failed to encode the state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+            if (next_file != state_files.size()) {
+                res->error(format_error_response("more media were given than the state has markers for", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            const std::vector<std::string> q_segments(ls.segments.begin() + first_question, ls.segments.end());
+            std::vector<llama_token> q_ids;
+            if (!system_one::resolve_question_slots(ctx_server.vocab, cfg, q_segments,
+                                                    media_tokens.size(), q_ids, media_slots, err)) {
+                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            media_tokens.insert(q_ids);
+        }
+
         system_one::plan plan;
         if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, plan, err)) {
             res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
@@ -5536,8 +5646,8 @@ void server_routes::init_routes() {
             {
                 server_task task(SERVER_TASK_TYPE_SYSTEM_ONE);
                 task.id     = rd_slot.get_new_id();
-                task.tokens = server_tokens(seq.tok.ids, false);
-                task.system_one.slots           = seq.tok.slots;
+                task.tokens = state_files.empty() ? server_tokens(seq.tok.ids, false) : std::move(media_tokens);
+                task.system_one.slots           = state_files.empty() ? seq.tok.slots : media_slots;
                 task.system_one.letters         = plan.labels;
                 task.system_one.n_options       = plan.n_options;
                 task.system_one.no_prefix_reuse = !plan.prefix_reuse;
