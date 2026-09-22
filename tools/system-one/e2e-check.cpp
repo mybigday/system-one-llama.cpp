@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -76,7 +77,10 @@ int main(int argc, char ** argv) {
     const std::string model_path = argv[1];
     const std::string golden_path = argv[2];
 
-    int  limit = -1, nthreads = 32;      // threads are pinned: they set the reduction order
+    // Threads are pinned, because they set the reduction order -- but not to the logical
+    // core count: oversubscribing the SMT siblings collapses throughput (measured 15x worse
+    // at 32 threads than at 16 on a 16-core box) while leaving the numbers unchanged.
+    int  limit = -1, nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
     bool kv_f32 = true, use_fa = false;
     // On a memoryless model llama_context::encode() computes logits for every row unless
     // n_outputs_max is below the batch size, which for a 262k vocab is most of the work.
