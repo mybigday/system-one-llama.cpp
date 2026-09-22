@@ -82,6 +82,22 @@ int main(int argc, char ** argv) {
            cfg.template_src.size(), (unsigned) (unsigned char) cfg.segment_separator[0],
            cfg.readout.c_str());
 
+    // A System One template writes its own BOS, like a chat template does -- but whether a
+    // format wants one is the format's business, not the tokenizer flag's. Say when the two
+    // disagree, since that is usually a template that forgot (or doubled) it.
+    {
+        const std::string bos = cfg.bos_text;
+        const bool tmpl_has_bos = !bos.empty() && cfg.template_src.find("bos_token") != std::string::npos;
+        const bool vocab_adds   = llama_vocab_get_add_bos(vocab);
+        if (vocab_adds && !tmpl_has_bos) {
+            printf("note: tokenizer.ggml.add_bos_token is set but the template never writes "
+                   "{{ bos_token }} -- the prompt will start without one\n");
+        } else if (!vocab_adds && tmpl_has_bos) {
+            printf("note: the template writes {{ bos_token }} although the tokenizer would not "
+                   "add one; fine if the format wants it (the reference dump will say)\n");
+        }
+    }
+
     std::vector<llama_token> label_ids;
     printf("labels: %zu, %s\n", cfg.labels.size(), label_tokens(vocab, cfg.labels, label_ids)
            ? "all single tokens" : "MISSING single-token pieces");
