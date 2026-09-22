@@ -142,7 +142,11 @@ class BertModel(TextModel):
 
             add_prefix = tokenizer.add_prefix_space  # ty: ignore[unresolved-attribute]
             remove_whitespaces = tokenizer.clean_up_tokenization_spaces  # ty: ignore[unresolved-attribute]
-            precompiled_charsmap = b64decode(tokenizer_json["normalizer"]["precompiled_charsmap"])
+            # a Unigram tokenizer.json does not have to carry a normalizer at all
+            # (sbintuitions/modernbert-ja-310m has "normalizer": null); the charsmap is
+            # optional on the writing side too, just below.
+            normalizer = tokenizer_json.get("normalizer") or {}
+            precompiled_charsmap = b64decode(normalizer["precompiled_charsmap"]) if "precompiled_charsmap" in normalizer else b""
 
             vocab_size = max(self.hparams.get("vocab_size", 0), tokenizer.vocab_size)  # ty: ignore[unresolved-attribute]
         else:
@@ -186,6 +190,7 @@ class BertModel(TextModel):
             added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
             unk_token = tokenizer_config_json.get("unk_token")
             unk_token_id = added_vocab.get(unk_token, tokenizer_json["model"].get("unk_id", 3))  # ty: ignore[no-matching-overload]
+            byte_fallback = tokenizer_json["model"].get("byte_fallback", False)
 
             for token_id in range(tokenizer.vocab_size):  # ty: ignore[unresolved-attribute]
                 piece = tokenizer._convert_id_to_token(token_id)  # ty: ignore[unresolved-attribute]
@@ -196,13 +201,15 @@ class BertModel(TextModel):
                     toktype = SentencePieceTokenTypes.NORMAL
                     if token_id == unk_token_id:
                         toktype = SentencePieceTokenTypes.UNKNOWN
+                    elif byte_fallback and len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+                        # jina has no byte tokens, but a model that declares byte_fallback
+                        # spells them exactly this way and they must not stay NORMAL --
+                        # detokenization turns a BYTE token back into its raw byte.
+                        toktype = SentencePieceTokenTypes.BYTE
                     elif token_id in tokenizer.all_special_ids:  # ty: ignore[unresolved-attribute]
                         toktype = SentencePieceTokenTypes.CONTROL
                     elif token_id in added_vocab.values():
                         toktype = SentencePieceTokenTypes.USER_DEFINED
-                    # No reliable way to detect this, but jina doesn't have any
-                    # elif tokenizer.IsByte(token_id):
-                    #     toktype = SentencePieceTokenTypes.BYTE
 
                     tokens[token_id] = text
                     scores[token_id] = score
@@ -604,6 +611,18 @@ class ModernBertModel(BertModel):
         self.gguf_writer.add_add_bos_token(True)
         self.gguf_writer.add_add_eos_token(True)
         self.gguf_writer.add_add_sep_token(True)
+
+        # ModernBERT is a recipe, not a tokenizer: the original English models are BPE,
+        # but derivatives are not (sbintuitions/modernbert-ja-310m is SentencePiece
+        # Unigram serialized into tokenizer.json). Ask the tokenizer instead of assuming.
+        with open(self.dir_model / "tokenizer.json", encoding="utf-8") as f:
+            toktyp = json.load(f)["model"]["type"]
+
+        if toktyp == "Unigram":
+            return self._xlmroberta_set_vocab()
+        if toktyp != "BPE":
+            raise ValueError(f"unsupported ModernBert tokenizer: {toktyp}")
+
         self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
