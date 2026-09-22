@@ -291,13 +291,25 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
 bool build_plan(const so_config & cfg,
                 const llama_vocab * vocab,
                 const std::string & state,
-                const std::vector<question> & qs,
+                const std::vector<question> & qs_in,
                 plan & out,
                 std::string & err) {
     out = plan();
-    if (qs.empty()) {
+    if (qs_in.empty()) {
         err = "a request needs at least one question";
         return false;
+    }
+
+    // The two sides of a yes/no question are a property of the format, not of the caller:
+    // every front end would otherwise have to know to spell them "no" and "yes". A caller
+    // that wants them worded differently still may -- this only fills in the blank.
+    std::vector<question> qs;
+    qs.reserve(qs_in.size());
+    for (auto q : qs_in) {
+        if (q.k == kind::noul && q.options.empty()) {
+            q.options = {"no", "yes"};
+        }
+        qs.push_back(std::move(q));
     }
 
     for (const auto & q : qs) {

@@ -108,10 +108,13 @@ struct plan {
     bool prefix_reuse = true;   // false when attention is bidirectional: nothing is reusable
 };
 
+// A noul question with no options declared gets {"no","yes"}: which words the two sides of
+// a yes/no answer are spelled with is a property of the format, not something each front end
+// should have to know. A caller that wants them worded differently still sets them.
 bool build_plan(const so_config & cfg,
                 const llama_vocab * vocab,
                 const std::string & state,
-                const std::vector<question> & qs,
+                const std::vector<question> & qs_in,
                 plan & out,
                 std::string & err);
 
