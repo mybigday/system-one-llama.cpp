@@ -25,6 +25,11 @@
 #include <string>
 #include <vector>
 
+// This header builds the input and reads the output. Running the model is deliberately not
+// here: like common/chat.h, which renders a prompt and parses a reply but never calls
+// llama_decode, this is the format layer, and inference belongs to whoever owns the batching
+// -- the server's scheduler, or a CLI's own loop.
+
 namespace system_one {
 
 enum class kind { noul, choice, score };
@@ -43,7 +48,9 @@ struct so_config {
     std::string template_src;                             // tokenizer.chat_template.system_one
     std::string segment_separator = "\x1e";               // system_one.segment_separator
 
-    // system_one.readout:
+    // Derived from the model's capabilities in from_model(), not required in the GGUF:
+    // a classification head means rank_head, a bidirectional model means masked_slot, and a
+    // causal one means letter_slot. system_one.readout overrides it when present.
     //   letter_slot  the next-token distribution at the end of a question's segment
     //   masked_slot  the distribution at a mask token inside it (bidirectional models)
     //   rank_head    one sequence per option, scored by the model's classification head --
@@ -166,25 +173,9 @@ struct context_needs {
 };
 
 // Capped, because a 255-option question should not demand a 255-sequence micro-batch.
-// run_plan() then fits whatever context it is actually given.
+// The caller then fits whatever context it actually created.
 constexpr size_t MAX_BATCHED_SEQS = 32;
 
 context_needs required_context(const so_config & cfg, const plan & p);
-
-// Run a plan and get its answers. Which readout it is, how many decodes that costs and where
-// the numbers come from is the plan's business, not the caller's -- a front end that drives
-// llama_decode directly calls this and never branches on the readout. (The server does not:
-// it dispatches through its own scheduler, and branches on plan.rank_pooling the way the rest
-// of tools/server branches on a capability.)
-bool run_plan(llama_context * ctx, const plan & p, std::vector<answer> & out, std::string & err);
-
-// One llama_decode over `t.ids`, then the label logits at every slot. run_plan() calls this
-// for the slot readouts; it stays public because the regression harnesses drive it directly.
-bool read_slots(llama_context * ctx,
-                const tokenized & t,
-                const std::vector<int> & n_options,
-                const std::vector<llama_token> & letter_ids,
-                std::vector<answer> & out,
-                std::string & err);
 
 } // namespace system_one

@@ -46,6 +46,29 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
     out.template_src = tmpl;
 
     std::string s;
+    // The readout follows from what the checkpoint *is*, so it does not have to be declared:
+    //   a classification head  -> the answer is that head's score, one sequence per option
+    //   bidirectional          -> the answer is read at a mask token inside the question
+    //   otherwise              -> the answer is the next token after the question
+    // Asked of capabilities, never of the architecture name -- llama_model_cls_label() returns
+    // null unless the model declares classifier labels, and causal attention is a kv every
+    // converter already writes. Verified to reproduce the declared readout on every System One
+    // checkpoint we have. An explicit system_one.readout still wins, for a checkpoint the rule
+    // would get wrong.
+    {
+        std::string arch;
+        bool causal = true;
+        if (meta_str(model, "general.architecture", arch)) {
+            std::string c;
+            if (meta_str(model, (arch + ".attention.causal").c_str(), c) && !c.empty()) {
+                causal = (c == "true" || c == "1");
+            }
+        }
+        const bool has_cls_head = llama_model_cls_label(model, 0) != nullptr;
+
+        out.readout = has_cls_head ? "rank_head" : (causal ? "letter_slot" : "masked_slot");
+    }
+
     if (meta_str(model, "system_one.readout", s) && !s.empty()) out.readout = s;
     if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
     if (meta_str(model, "system_one.labels", s) && !s.empty()) out.labels = split_array(s);
@@ -451,135 +474,6 @@ context_needs required_context(const so_config & cfg, const plan & p) {
     }
 
     return need;
-}
-
-// rank_head scores one sequence per option through the model's classification head. They are
-// independent, so they go into as few decodes as the context allows rather than one each.
-// Two limits set the chunk size, and both are asked of the context rather than assumed: a
-// sequence needs a seq_id of its own, and a bidirectional model cannot have a sequence split
-// across ubatches, so a whole chunk has to fit in one.
-static bool score_sequences(llama_context * ctx, const plan & p,
-                            std::vector<float> & scores, std::string & err) {
-    const uint32_t n_ubatch  = llama_n_ubatch(ctx);
-    const uint32_t n_seq_max = llama_n_seq_max(ctx);
-
-    scores.assign(p.sequences.size(), 0.0f);
-
-    for (size_t i = 0; i < p.sequences.size(); ) {
-        size_t n_seq = 0;
-        size_t n_tok = 0;
-        while (i + n_seq < p.sequences.size() && n_seq < n_seq_max) {
-            const size_t len = p.sequences[i + n_seq].tok.ids.size();
-            if (len > n_ubatch) {
-                err = "one option sequence is " + std::to_string(len) +
-                      " tokens, more than the micro-batch (" + std::to_string(n_ubatch) +
-                      ") -- raise -ub";
-                return false;
-            }
-            if (n_tok + len > n_ubatch) {
-                break;
-            }
-            n_tok += len;
-            n_seq++;
-        }
-
-        llama_memory_clear(llama_get_memory(ctx), true);
-
-        llama_batch batch = llama_batch_init((int32_t) n_tok, 0, (int32_t) n_seq);
-        batch.n_tokens = (int32_t) n_tok;
-        size_t at = 0;
-        for (size_t k = 0; k < n_seq; k++) {
-            const auto & ids = p.sequences[i + k].tok.ids;
-            for (size_t j = 0; j < ids.size(); j++, at++) {
-                batch.token[at]     = ids[j];
-                batch.pos[at]       = (llama_pos) j;
-                batch.n_seq_id[at]  = 1;
-                batch.seq_id[at][0] = (llama_seq_id) k;
-                batch.logits[at]    = 1;
-            }
-        }
-        const int rc = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) {
-            err = "llama_decode failed on the batch starting at sequence " + std::to_string(i);
-            return false;
-        }
-
-        for (size_t k = 0; k < n_seq; k++) {
-            const float * out = llama_get_embeddings_seq(ctx, (llama_seq_id) k);
-            if (out == nullptr) {
-                err = "the model returned no pooled score -- is it a classification head?";
-                return false;
-            }
-            scores[i + k] = out[0];
-        }
-
-        i += n_seq;
-    }
-    return true;
-}
-
-bool run_plan(llama_context * ctx, const plan & p, std::vector<answer> & out, std::string & err) {
-    if (p.sequences.empty()) {
-        err = "an empty plan has nothing to run";
-        return false;
-    }
-    if (p.rank_pooling) {
-        std::vector<float> scores;
-        return score_sequences(ctx, p, scores, err) && answers_from_scores(p, scores, out, err);
-    }
-    return read_slots(ctx, p.sequences.front().tok, p.n_options, p.labels, out, err);
-}
-
-bool read_slots(llama_context * ctx,
-                const tokenized & t,
-                const std::vector<int> & n_options,
-                const std::vector<llama_token> & letter_ids,
-                std::vector<answer> & out,
-                std::string & err) {
-    if (t.slots.size() != n_options.size()) {
-        err = "slot count does not match question count";
-        return false;
-    }
-
-    llama_batch batch = llama_batch_init((int32_t) t.ids.size(), 0, 1);
-    batch.n_tokens = (int32_t) t.ids.size();
-    for (size_t i = 0; i < t.ids.size(); i++) {
-        batch.token[i]     = t.ids[i];
-        batch.pos[i]       = (llama_pos) i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = 0;
-    }
-    for (int slot : t.slots) {
-        if (slot < 0 || slot >= (int) t.ids.size()) {
-            llama_batch_free(batch);
-            err = "answer slot outside the sequence";
-            return false;
-        }
-        batch.logits[slot] = 1;
-    }
-
-    const int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
-    if (rc != 0) {
-        err = "llama_decode failed with " + std::to_string(rc);
-        return false;
-    }
-
-    out.clear();
-    for (size_t i = 0; i < t.slots.size(); i++) {
-        const int n = n_options[i];
-        if (n < 1 || n > (int) letter_ids.size()) {
-            err = "option count " + std::to_string(n) + " is outside the label set";
-            return false;
-        }
-        const float * lg = llama_get_logits_ith(ctx, t.slots[i]);
-        if (!lg) { err = "no logits at an answer slot"; return false; }
-
-        out.push_back(answer_from_logits(lg, letter_ids, n));
-    }
-    return true;
 }
 
 } // namespace system_one
