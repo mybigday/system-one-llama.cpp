@@ -118,6 +118,47 @@ struct plan {
 // A noul question with no options declared gets {"no","yes"}: which words the two sides of
 // a yes/no answer are spelled with is a property of the format, not something each front end
 // should have to know. A caller that wants them worded differently still sets them.
+// What a request renders to, before anything is tokenized. The trailing `n_question_segments`
+// of each sequence are the question blocks; everything before them is the state.
+//
+// This exists so a caller can encode the state itself -- with mtmd, when it carries images or
+// audio -- and still get the question slots placed by the same rule as the text-only path.
+// Splitting a request is phase one, turning it into tokens is phase two, and build_plan() is
+// simply the two composed for a caller that has nothing but text.
+struct layout {
+    struct sequence {
+        std::vector<std::string> segments;
+        size_t n_question_segments = 0;
+        size_t question = 0;   // rank_head: the question this sequence scores
+        size_t option   = 0;   // rank_head: the option it scores
+    };
+
+    std::vector<sequence>    sequences;
+    std::vector<int>         n_options;
+    std::vector<llama_token> labels;
+    bool rank_pooling = false;
+    bool prefix_reuse = true;
+};
+
+bool build_layout(const so_config & cfg,
+                  const llama_vocab * vocab,
+                  const std::string & state,
+                  const std::vector<question> & qs_in,
+                  layout & out,
+                  std::string & err);
+
+// Place the answer slots of the question segments, given how many positions the state already
+// occupies. The state may be anything -- plain text, or text with media chunks the caller
+// encoded itself -- because a question segment is always text, and the slot rule only needs to
+// know where the question blocks begin.
+bool resolve_question_slots(const llama_vocab * vocab,
+                            const so_config & cfg,
+                            const std::vector<std::string> & question_segments,
+                            size_t prefix_positions,
+                            std::vector<llama_token> & ids_out,
+                            std::vector<int> & slots_out,
+                            std::string & err);
+
 bool build_plan(const so_config & cfg,
                 const llama_vocab * vocab,
                 const std::string & state,

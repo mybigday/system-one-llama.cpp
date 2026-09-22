@@ -243,6 +243,50 @@ bool render_pair_segments(const so_config & cfg,
 
 // ---------------------------------------------------------------- tokenization
 
+bool resolve_question_slots(const llama_vocab * vocab,
+                            const so_config & cfg,
+                            const std::vector<std::string> & question_segments,
+                            size_t prefix_positions,
+                            std::vector<llama_token> & ids_out,
+                            std::vector<int> & slots_out,
+                            std::string & err) {
+    ids_out.clear();
+    slots_out.clear();
+
+    const bool masked = cfg.masked();
+
+    for (size_t i = 0; i < question_segments.size(); i++) {
+        // Special tokens -- BOS, a mask -- are written into the template as text and have to
+        // parse back to their ids. HF's tokenizers split on added and special tokens regardless
+        // of add_special_tokens, so parsing them is what matches the reference.
+        const auto ids = common_tokenize(vocab, question_segments[i], false, true);
+        if (ids.empty()) {
+            err = "question segment " + std::to_string(i) + " tokenized to nothing";
+            return false;
+        }
+        const size_t base = prefix_positions + ids_out.size();
+        ids_out.insert(ids_out.end(), ids.begin(), ids.end());
+
+        if (!masked) {
+            slots_out.push_back((int) (base + ids.size() - 1));
+            continue;
+        }
+
+        // the answer is read at the mask token itself; take the last one in the segment
+        int slot = -1;
+        for (size_t j = ids.size(); j-- > 0; ) {
+            if (ids[j] == cfg.mask_token) { slot = (int) (base + j); break; }
+        }
+        if (slot < 0) {
+            err = "question segment " + std::to_string(i) +
+                  " has no mask token (" + std::to_string(cfg.mask_token) + ") after tokenization";
+            return false;
+        }
+        slots_out.push_back(slot);
+    }
+    return true;
+}
+
 bool tokenize_segments(const llama_vocab * vocab,
                        const so_config & cfg,
                        const std::vector<std::string> & segments,
@@ -257,41 +301,23 @@ bool tokenize_segments(const llama_vocab * vocab,
     out.ids.clear();
     out.slots.clear();
 
-    // Special tokens -- BOS, a mask -- are written into the template as text and have to parse
-    // back to their ids. HF's tokenizers split on added and special tokens regardless of
-    // add_special_tokens, so parsing them is what matches the reference.
-    const bool masked = cfg.masked();
-
-    // the question blocks are the trailing segments
+    // the question blocks are the trailing segments; everything before them is the state
     const size_t first_question = segments.size() - n_questions;
-    for (size_t i = 0; i < segments.size(); i++) {
+    for (size_t i = 0; i < first_question; i++) {
         const auto ids = common_tokenize(vocab, segments[i], false, true);
         if (ids.empty()) {
             err = "segment " + std::to_string(i) + " tokenized to nothing";
             return false;
         }
-        const size_t base = out.ids.size();
         out.ids.insert(out.ids.end(), ids.begin(), ids.end());
-
-        if (i < first_question) continue;
-
-        if (!masked) {
-            out.slots.push_back((int) out.ids.size() - 1);
-            continue;
-        }
-
-        // the answer is read at the mask token itself; take the last one in the segment
-        int slot = -1;
-        for (size_t j = ids.size(); j-- > 0; ) {
-            if (ids[j] == cfg.mask_token) { slot = (int) (base + j); break; }
-        }
-        if (slot < 0) {
-            err = "question segment " + std::to_string(i - first_question) +
-                  " has no mask token (" + std::to_string(cfg.mask_token) + ") after tokenization";
-            return false;
-        }
-        out.slots.push_back(slot);
     }
+
+    std::vector<llama_token> q_ids;
+    const std::vector<std::string> q_segments(segments.begin() + first_question, segments.end());
+    if (!resolve_question_slots(vocab, cfg, q_segments, out.ids.size(), q_ids, out.slots, err)) {
+        return false;
+    }
+    out.ids.insert(out.ids.end(), q_ids.begin(), q_ids.end());
     return true;
 }
 
@@ -311,13 +337,13 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
 
 // ---------------------------------------------------------------- planning
 
-bool build_plan(const so_config & cfg,
-                const llama_vocab * vocab,
-                const std::string & state,
-                const std::vector<question> & qs_in,
-                plan & out,
-                std::string & err) {
-    out = plan();
+bool build_layout(const so_config & cfg,
+                  const llama_vocab * vocab,
+                  const std::string & state,
+                  const std::vector<question> & qs_in,
+                  layout & out,
+                  std::string & err) {
+    out = layout();
     if (qs_in.empty()) {
         err = "a request needs at least one question";
         return false;
@@ -350,11 +376,9 @@ bool build_plan(const so_config & cfg,
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
             for (size_t oi = 0; oi < qs[qi].options.size(); oi++) {
-                std::vector<std::string> segments;
-                if (!render_pair_segments(cfg, state, qs[qi], oi, segments, err)) return false;
-
-                plan::sequence seq;
-                if (!tokenize_segments(vocab, cfg, segments, 0, seq.tok, err)) return false;
+                layout::sequence seq;
+                if (!render_pair_segments(cfg, state, qs[qi], oi, seq.segments, err)) return false;
+                seq.n_question_segments = 0;   // the head scores the sequence, nothing is read at a slot
                 seq.question = qi;
                 seq.option   = oi;
                 out.sequences.push_back(std::move(seq));
@@ -372,20 +396,45 @@ bool build_plan(const so_config & cfg,
         if (q.options.size() > cfg.labels.size()) {
             err = "a question has " + std::to_string(q.options.size()) + " options but this "
                   "readout has only " + std::to_string(cfg.labels.size()) + " labels; a model "
-                  "with a scoring head (system_one.readout = rank_head) has no such limit";
+                  "with a scoring head (rank_head) has no such limit";
             return false;
         }
     }
 
-    std::vector<std::string> segments;
-    if (!render_segments(cfg, state, qs, segments, err)) return false;
-
-    plan::sequence seq;
-    if (!tokenize_segments(vocab, cfg, segments, qs.size(), seq.tok, err)) return false;
+    layout::sequence seq;
+    if (!render_segments(cfg, state, qs, seq.segments, err)) return false;
+    seq.n_question_segments = qs.size();
     out.sequences.push_back(std::move(seq));
 
     // a bidirectional readout reads from inside the canvas, so no prefix survives a change
     out.prefix_reuse = !cfg.masked();
+    return true;
+}
+
+bool build_plan(const so_config & cfg,
+                const llama_vocab * vocab,
+                const std::string & state,
+                const std::vector<question> & qs_in,
+                plan & out,
+                std::string & err) {
+    layout lay;
+    if (!build_layout(cfg, vocab, state, qs_in, lay, err)) return false;
+
+    out = plan();
+    out.n_options    = lay.n_options;
+    out.labels       = lay.labels;
+    out.rank_pooling = lay.rank_pooling;
+    out.prefix_reuse = lay.prefix_reuse;
+
+    for (const auto & ls : lay.sequences) {
+        plan::sequence seq;
+        seq.question = ls.question;
+        seq.option   = ls.option;
+        if (!tokenize_segments(vocab, cfg, ls.segments, ls.n_question_segments, seq.tok, err)) {
+            return false;
+        }
+        out.sequences.push_back(std::move(seq));
+    }
     return true;
 }
 
