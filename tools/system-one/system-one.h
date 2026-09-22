@@ -43,8 +43,11 @@ struct so_config {
     std::string template_src;                             // tokenizer.chat_template.system_one
     std::string segment_separator = "\x1e";               // system_one.segment_separator
 
-    // system_one.readout: letter_slot reads the next-token distribution at the end of a
-    // question's segment, masked_slot reads the distribution at the mask token inside it
+    // system_one.readout:
+    //   letter_slot  the next-token distribution at the end of a question's segment
+    //   masked_slot  the distribution at a mask token inside it (bidirectional models)
+    //   rank_head    one sequence per option, scored by the model's classification head --
+    //                the reranker shape, and the only readout that costs K forward passes
     std::string readout = "letter_slot";
 
     // system_one.labels: option i is labelled labels[i] and that token is what gets read
@@ -57,6 +60,7 @@ struct so_config {
     std::string eos_text;           // templates do, instead of a flag saying "prepend one"
 
     bool masked() const { return readout == "masked_slot"; }
+    bool ranked() const { return readout == "rank_head"; }
 
     // Reads the metadata. Fails when the model carries no System One template.
     static bool from_model(const llama_model * model, so_config & out, std::string & err);
@@ -70,6 +74,16 @@ bool render_segments(const so_config & cfg,
                      const std::vector<question> & qs,
                      std::vector<std::string> & segments,
                      std::string & err);
+
+// A rank_head prompt is built per (question, option) pair rather than once for the whole
+// request: the template sees `state`, `question` and `option` instead of `questions`.
+bool render_pair_segments(const so_config & cfg,
+                          const std::string & state,
+                          const question & q,
+                          size_t option_index,
+                          std::vector<std::string> & segments,
+                          std::string & err);
+
 
 struct tokenized {
     std::vector<llama_token> ids;
@@ -106,6 +120,10 @@ answer answer_from_logits(const float * row, const std::vector<llama_token> & le
 
 // Expected value over an ordered rubric: sum(i * p_i), the `score` question type.
 float score_expectation(const answer & a);
+
+// Softmax over one question's option scores, with the same confidence measure the slot
+// readouts report. The scores come from the model's classification head, one per sequence.
+answer answer_from_scores(const std::vector<float> & scores);
 
 // One llama_decode over `t.ids`, then the label logits at every slot.
 bool read_slots(llama_context * ctx,

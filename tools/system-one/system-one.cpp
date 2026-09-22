@@ -70,7 +70,7 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
         for (char c = 'a'; c <= 'z'; c++) out.labels.push_back(std::string(1, c));
     }
 
-    if (out.readout != "letter_slot" && out.readout != "masked_slot") {
+    if (out.readout != "letter_slot" && out.readout != "masked_slot" && out.readout != "rank_head") {
         err = "unsupported system_one.readout: " + out.readout;
         return false;
     }
@@ -108,6 +108,43 @@ static const char * kind_name(kind k) {
     }
 }
 
+static bool render_and_split(const so_config & cfg, const json & inp,
+                             std::vector<std::string> & segments, std::string & err) {
+    std::string rendered;
+    try {
+        jinja::lexer lexer;
+        auto lexer_res = lexer.tokenize(cfg.template_src);
+        jinja::program prog = jinja::parse_from_tokens(lexer_res);
+
+        jinja::context ctx(lexer_res.source);
+        jinja::global_from_json(ctx, inp, false);
+
+        jinja::runtime runtime(ctx);
+        const jinja::value results = runtime.execute(prog);
+        auto parts = jinja::runtime::gather_string_parts(results);
+        rendered = parts->as_string().str();
+    } catch (const std::exception & e) {
+        err = std::string("system_one template failed to render: ") + e.what();
+        return false;
+    }
+
+    segments.clear();
+    size_t pos = 0;
+    while (true) {
+        const size_t next = rendered.find(cfg.segment_separator, pos);
+        if (next == std::string::npos) {
+            segments.push_back(rendered.substr(pos));
+            break;
+        }
+        segments.push_back(rendered.substr(pos, next - pos));
+        pos = next + cfg.segment_separator.size();
+    }
+    segments.erase(std::remove_if(segments.begin(), segments.end(),
+                                  [](const std::string & s) { return s.empty(); }),
+                   segments.end());
+    return true;
+}
+
 bool render_segments(const so_config & cfg,
                      const std::string & state,
                      const std::vector<question> & qs,
@@ -138,52 +175,58 @@ bool render_segments(const so_config & cfg,
         });
     }
 
-    std::string rendered;
-    try {
-        jinja::lexer lexer;
-        auto lexer_res = lexer.tokenize(cfg.template_src);
-        jinja::program prog = jinja::parse_from_tokens(lexer_res);
+    const json inp = json{
+        {"state",     state},
+        {"questions", questions},
+        {"sep",       cfg.segment_separator},
+        {"mask",      cfg.mask_text},      // empty unless the format places a mask token
+        {"bos_token", cfg.bos_text},       // as a chat template gets them: the prompt says
+        {"eos_token", cfg.eos_text},       // where they go, no flag decides it
+    };
 
-        jinja::context ctx(lexer_res.source);
-        const json inp = json{
-            {"state",     state},
-            {"questions", questions},
-            {"sep",       cfg.segment_separator},
-            {"mask",      cfg.mask_text},      // empty unless the format places a mask token
-            {"bos_token", cfg.bos_text},       // as a chat template gets them: the prompt says
-            {"eos_token", cfg.eos_text},       // where they go, no flag decides it
-        };
-        jinja::global_from_json(ctx, inp, false);
-
-        jinja::runtime runtime(ctx);
-        const jinja::value results = runtime.execute(prog);
-        auto parts = jinja::runtime::gather_string_parts(results);
-        rendered = parts->as_string().str();
-    } catch (const std::exception & e) {
-        err = std::string("system_one template failed to render: ") + e.what();
-        return false;
-    }
-
-    segments.clear();
-    size_t pos = 0;
-    while (true) {
-        const size_t next = rendered.find(cfg.segment_separator, pos);
-        if (next == std::string::npos) {
-            segments.push_back(rendered.substr(pos));
-            break;
-        }
-        segments.push_back(rendered.substr(pos, next - pos));
-        pos = next + cfg.segment_separator.size();
-    }
-    // a separator at the very start produces a leading empty piece; drop empties, they
-    // tokenize to nothing anyway and would only confuse the slot indexing
-    segments.erase(std::remove_if(segments.begin(), segments.end(),
-                                  [](const std::string & s) { return s.empty(); }),
-                   segments.end());
+    if (!render_and_split(cfg, inp, segments, err)) return false;
 
     if (segments.size() < qs.size()) {
         err = "template produced " + std::to_string(segments.size()) + " segments for " +
               std::to_string(qs.size()) + " questions: the separator must precede every question block";
+        return false;
+    }
+    return true;
+}
+
+bool render_pair_segments(const so_config & cfg,
+                          const std::string & state,
+                          const question & q,
+                          size_t option_index,
+                          std::vector<std::string> & segments,
+                          std::string & err) {
+    if (option_index >= q.options.size()) {
+        err = "option index out of range";
+        return false;
+    }
+    const bool has_desc = option_index < q.descs.size() && !q.descs[option_index].empty();
+
+    const json inp = json{
+        {"state", state},
+        {"question", json{
+            {"kind", kind_name(q.k)},
+            {"text", q.text},
+        }},
+        {"option", json{
+            {"label",  option_index < cfg.labels.size() ? cfg.labels[option_index] : std::string("?")},
+            {"option", q.options[option_index]},
+            {"desc",   has_desc ? json(q.descs[option_index]) : json(nullptr)},
+            {"index",  (int) option_index},
+        }},
+        {"sep",       cfg.segment_separator},
+        {"mask",      cfg.mask_text},
+        {"bos_token", cfg.bos_text},
+        {"eos_token", cfg.eos_text},
+    };
+
+    if (!render_and_split(cfg, inp, segments, err)) return false;
+    if (segments.empty()) {
+        err = "template rendered nothing for this question/option pair";
         return false;
     }
     return true;
@@ -294,6 +337,22 @@ answer answer_from_logits(const float * row, const std::vector<llama_token> & le
         double h = 0.0;
         for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
         a.confidence = (float) (1.0 - h / std::log((double) n_options));
+    } else {
+        a.confidence = 1.0f;
+    }
+    return a;
+}
+
+answer answer_from_scores(const std::vector<float> & scores) {
+    answer a;
+    a.logits = scores;                 // the head's raw output, as the caller gets it
+    a.probs  = softmax(scores);
+    a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
+
+    if (scores.size() > 1) {
+        double h = 0.0;
+        for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
+        a.confidence = (float) (1.0 - h / std::log((double) scores.size()));
     } else {
         a.confidence = 1.0f;
     }

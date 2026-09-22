@@ -5461,13 +5461,14 @@ void server_routes::init_routes() {
                 res->error(format_error_response("question \"" + key + "\" needs at least two options", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            if (out.options.size() > cfg.labels.size()) {
-                // above one slot's label set the exact path is per-option scoring, which
-                // this route does not implement yet -- say so instead of approximating
+            if (!cfg.ranked() && out.options.size() > cfg.labels.size()) {
+                // a slot readout can only distinguish as many options as it has labels;
+                // rank_head scores each option on its own sequence and has no such ceiling
                 res->error(format_error_response(
                     "question \"" + key + "\" has " + std::to_string(out.options.size()) +
                     " options; this readout supports at most " + std::to_string(cfg.labels.size()) +
-                    " (per-option mode for larger sets is not implemented yet)", ERROR_TYPE_NOT_SUPPORTED));
+                    ". A model with a scoring head (system_one.readout = rank_head) has no limit",
+                    ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
 
@@ -5493,6 +5494,99 @@ void server_routes::init_routes() {
                 "this server accepts at most " + std::to_string(max_per_seq) +
                 " question(s) per request; restart it with --n-outputs-max-per-seq " +
                 std::to_string(questions.size()) + " (or higher)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // A scoring head reads a sequence-level score rather than a distribution at a
+        // position, so each option gets its own sequence -- which is exactly what a rerank
+        // task already is. K options cost K forward passes; that is the readout's price.
+        if (cfg.ranked()) {
+            if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
+                res->error(format_error_response(
+                    "this model answers with a classification head; start the server with --reranking",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            std::vector<server_task> tasks;
+            std::vector<size_t>      n_seqs;   // sequences per question, in request order
+            auto & rd_rank = res->rd;
+            size_t idx = 0;
+            for (size_t qi = 0; qi < questions.size(); qi++) {
+                n_seqs.push_back(questions[qi].options.size());
+                for (size_t oi = 0; oi < questions[qi].options.size(); oi++) {
+                    std::vector<std::string> segs;
+                    if (!system_one::render_pair_segments(cfg, state, questions[qi], oi, segs, err)) {
+                        res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                    system_one::tokenized tok_pair;
+                    if (!system_one::tokenize_segments(ctx_server.vocab, cfg, segs, 0, tok_pair, err)) {
+                        res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                    server_task task(SERVER_TASK_TYPE_RERANK);
+                    task.id     = rd_rank.get_new_id();
+                    task.index  = idx++;
+                    task.tokens = server_tokens(tok_pair.ids, false);
+                    tasks.push_back(std::move(task));
+                }
+            }
+            const size_t n_total = idx;
+            rd_rank.post_tasks(std::move(tasks));
+
+            auto all = rd_rank.wait_for_all(req.should_stop);
+            if (all.is_terminated) return res;
+            if (all.error) { res->error(all.error->to_json()); return res; }
+
+            std::vector<float>   scores(n_total, 0.0f);
+            std::vector<int32_t> n_tokens_seen(n_total, 0);
+            for (auto & one : all.results) {
+                auto * rr = dynamic_cast<server_task_result_rerank *>(one.get());
+                GGML_ASSERT(rr != nullptr);
+                if (rr->index < n_total) {
+                    scores[rr->index]        = rr->score;
+                    n_tokens_seen[rr->index] = rr->n_tokens;
+                }
+            }
+
+            json answers_rank = json::object();
+            int32_t n_tokens_total = 0;
+            size_t  at = 0;
+            for (size_t qi = 0; qi < keys.size(); qi++) {
+                std::vector<float> q_scores(scores.begin() + at, scores.begin() + at + n_seqs[qi]);
+                for (size_t j = 0; j < n_seqs[qi]; j++) n_tokens_total += n_tokens_seen[at + j];
+                at += n_seqs[qi];
+
+                const auto a = system_one::answer_from_scores(q_scores);
+                json one = json::object();
+                if (kinds[qi] == "noul") {
+                    one["noul"] = a.probs.back();
+                } else if (kinds[qi] == "choice") {
+                    json per_option = json::object();
+                    for (size_t j = 0; j < options[qi].size(); j++) per_option[options[qi][j]] = a.probs[j];
+                    one["choice"]        = options[qi][a.choice];
+                    one["probabilities"] = per_option;
+                } else {
+                    one["score"]         = system_one::score_expectation(a);
+                    one["legend"]        = options[qi];
+                    one["probabilities"] = a.probs;
+                }
+                one["confidence"] = a.confidence;
+                one["logits"]     = a.logits;   // the head's raw scores
+                answers_rank[keys[qi]] = one;
+            }
+
+            json root_rank = json::object();
+            root_rank["model"]   = meta->model_name;
+            root_rank["answers"] = answers_rank;
+            json usage_rank = json::object();
+            usage_rank["input_tokens"]  = n_tokens_total;
+            usage_rank["output_tokens"] = 0;
+            usage_rank["sequences"]     = (int) n_total;   // K per question: the readout's cost
+            root_rank["usage"] = usage_rank;
+
+            res->ok(root_rank);
             return res;
         }
 
