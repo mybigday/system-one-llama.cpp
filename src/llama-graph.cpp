@@ -3718,9 +3718,16 @@ void llm_graph_context::build_pooling(
             } break;
         case LLAMA_POOLING_TYPE_RANK:
             {
-                if (arch == LLM_ARCH_MODERN_BERT) {
-                    // modern bert gte reranker builds mean first then applies prediction head and classifier
-                    // https://github.com/huggingface/transformers/blob/main/src/transformers/models/modernbert/modular_modernbert.py#L1404-1411
+                // How the sequence is pooled before the head is the model's own business:
+                // ModernBertForSequenceClassification declares config.classifier_pooling, which
+                // is "mean" for gte-reranker-modernbert but "cls" for others (the ModernBertConfig
+                // default is in fact "cls"). GGUFs converted before the converter wrote it carry
+                // no pooling type at all, so they keep the mean they were built against.
+                // https://github.com/huggingface/transformers/blob/main/src/transformers/models/modernbert/modular_modernbert.py#L1404-1411
+                const bool pool_mean = arch == LLM_ARCH_MODERN_BERT &&
+                                       hparams.pooling_type != LLAMA_POOLING_TYPE_CLS;
+
+                if (pool_mean) {
                     ggml_tensor * inp_mean = build_inp_mean();
                     cur = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, inp)), inp_mean);
                 } else {
