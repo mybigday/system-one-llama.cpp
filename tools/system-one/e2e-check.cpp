@@ -32,7 +32,8 @@ using namespace system_one;
 
 // Is the linked ggml computing GELU exactly in f32, or through the fp16 lookup table
 // (ggml-cpu/vec.h: GGML_GELU_FP16)? The table is a systematic ~5e-4 relative error per
-// activation and dominates any comparison against a HF fp32 reference.
+// activation and dominates a comparison against a HF fp32 reference -- but only where the
+// activation runs on the CPU, so this says nothing about layers offloaded to a GPU.
 static bool ggml_gelu_is_exact() {
     const int n = 1024;
     std::vector<float> xs(n);
@@ -77,8 +78,18 @@ int main(int argc, char ** argv) {
 
     int  limit = -1, nthreads = 32;      // threads are pinned: they set the reduction order
     bool kv_f32 = true, use_fa = false;
+    // On a memoryless model llama_context::encode() computes logits for every row unless
+    // n_outputs_max is below the batch size, which for a 262k vocab is most of the work.
+    // Sizing it to the answers is the whole point of this readout; --outputs-uncapped
+    // measures what that is worth.
+    bool cap_outputs = true;
+    int  n_gpu_layers = 0;
     std::string dump_path;
-    for (int i = 3; i < argc - 1; i++) {
+    for (int i = 3; i < argc; i++) {
+        const bool has_val = i + 1 < argc;
+        if (strcmp(argv[i], "--outputs-uncapped") == 0) { cap_outputs = false; continue; }
+        if (strcmp(argv[i], "--ngl") == 0 && i + 1 < argc) { n_gpu_layers = atoi(argv[i+1]); continue; }
+        if (!has_val) continue;
         if      (strcmp(argv[i], "--limit")   == 0) limit    = atoi(argv[i+1]);
         else if (strcmp(argv[i], "--threads") == 0) nthreads = atoi(argv[i+1]);
         else if (strcmp(argv[i], "--kv")      == 0) kv_f32   = strcmp(argv[i+1], "f32") == 0;
@@ -92,7 +103,7 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = n_gpu_layers;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { fprintf(stderr, "failed to load %s\n", model_path.c_str()); return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -138,7 +149,14 @@ int main(int argc, char ** argv) {
         prep.push_back(std::move(p));
     }
 
+    size_t max_slots = 0;
+    for (const auto & p : prep) max_slots = std::max(max_slots, p.t.slots.size());
+
     llama_context_params cp = llama_context_default_params();
+    if (cap_outputs) {
+        cp.n_outputs_max         = (uint32_t) max_slots;
+        cp.n_outputs_max_per_seq = (uint32_t) max_slots;
+    }
     cp.n_ctx           = max_len + 8;
     cp.n_batch         = max_len + 8;
     cp.n_ubatch        = max_len + 8;
@@ -152,9 +170,12 @@ int main(int argc, char ** argv) {
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
     const bool gelu_exact = ggml_gelu_is_exact();
-    printf("build: gelu=%s  kv=%s  flash_attn=%s  threads=%d\n",
-           gelu_exact ? "exact-f32" : "fp16-table", kv_f32 ? "f32" : "f16", use_fa ? "on" : "off", nthreads);
-    printf("readout: %s, %zu labels, attention from the model\n", cfg.readout.c_str(), cfg.labels.size());
+    printf("build: cpu-gelu=%s  kv=%s  flash_attn=%s  threads=%d  ngl=%d\n",
+           gelu_exact ? "exact-f32" : "fp16-table", kv_f32 ? "f32" : "f16", use_fa ? "on" : "off",
+           nthreads, n_gpu_layers);
+    printf("readout: %s, %zu labels, outputs %s\n", cfg.readout.c_str(), cfg.labels.size(),
+           cap_outputs ? "capped to the answer slots" : "uncapped (every row)");
+
     printf("ids come from our own tokenizer (the golden's input_ids are not used)\n");
 
     double sum_dl = 0, max_dl = 0, sum_dp = 0, max_dp = 0;
@@ -221,7 +242,7 @@ int main(int argc, char ** argv) {
         json out = {
             {"model", model_path}, {"golden", golden_path},
             {"build", gelu_exact ? "exact-f32-gelu" : "stock-fp16-gelu-table"},
-            {"gelu_exact", gelu_exact}, {"threads", nthreads},
+            {"cpu_gelu_exact", gelu_exact}, {"threads", nthreads}, {"n_gpu_layers", n_gpu_layers},
             {"kv_f32", kv_f32}, {"flash_attn", use_fa},
             {"ids_source", "llama.cpp (system_one template)"},
             {"n_items", prep.size()}, {"n_slots", n_slots},
