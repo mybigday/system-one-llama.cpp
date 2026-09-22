@@ -238,18 +238,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    size_t n_seq = 0;
-    size_t n_tok = 0;
-    system_one::plan_batch_hint(plan, n_seq, n_tok);
-    if (n_seq > 1) {
-        params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) n_seq);
-        params.n_ubatch   = std::max<int32_t>(params.n_ubatch,   (int32_t) n_tok);
+    // What the checkpoint's readout needs of the context, applied here rather than by the
+    // library, so every value the context is built with is visible at this one place.
+    const system_one::context_needs need = system_one::required_context(cfg, plan);
+
+    if (need.embeddings) {
+        params.embedding = true;
+    }
+    if (need.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        params.pooling_type = need.pooling_type;
+    }
+    if (need.n_seq > 1) {
+        params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) need.n_seq);
+        params.n_ubatch   = std::max<int32_t>(params.n_ubatch,   (int32_t) need.n_tokens);
         params.n_batch    = std::max<int32_t>(params.n_batch,    params.n_ubatch);
         params.n_ctx      = std::max<int32_t>(params.n_ctx,      params.n_ubatch);
     }
 
     llama_context_params cparams = common_context_params_to_llama(params);
-    system_one::apply_context_params(cfg, cparams);
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
         LOG_ERR("%s: failed to create the context\n", __func__);

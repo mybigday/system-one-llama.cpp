@@ -435,21 +435,22 @@ float score_expectation(const answer & a) {
     return (float) e;
 }
 
-void apply_context_params(const so_config & cfg, llama_context_params & cparams) {
+context_needs required_context(const so_config & cfg, const plan & p) {
+    context_needs need;
+
     if (cfg.ranked()) {
         // the answer is the classification head's output, which is reached as a pooled
         // embedding -- so the context has to compute embeddings, pooled as a rank score
-        cparams.embeddings   = true;
-        cparams.pooling_type = LLAMA_POOLING_TYPE_RANK;
+        need.embeddings   = true;
+        need.pooling_type = LLAMA_POOLING_TYPE_RANK;
     }
-}
 
-void plan_batch_hint(const plan & p, size_t & n_seq, size_t & n_tokens) {
-    n_seq    = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
-    n_tokens = 0;
-    for (size_t i = 0; i < n_seq; i++) {
-        n_tokens += p.sequences[i].tok.ids.size();
+    need.n_seq = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
+    for (size_t i = 0; i < need.n_seq; i++) {
+        need.n_tokens += p.sequences[i].tok.ids.size();
     }
+
+    return need;
 }
 
 // rank_head scores one sequence per option through the model's classification head. They are

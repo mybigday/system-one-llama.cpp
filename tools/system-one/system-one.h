@@ -155,16 +155,21 @@ answer answer_from_scores(const std::vector<float> & scores);
 bool answers_from_scores(const plan & p, const std::vector<float> & scores,
                          std::vector<answer> & out, std::string & err);
 
-// What the readout requires of a context. Everything else about it -- threads, context length,
-// where it runs -- is the caller's business; this is only the part the checkpoint dictates.
-void apply_context_params(const so_config & cfg, llama_context_params & cparams);
+// What a request needs of the context that will run it. This only reports; applying it is the
+// caller's, so nothing it owns changes behind its back and it stays free to refuse, to clamp,
+// or to keep a value the user asked for.
+struct context_needs {
+    bool               embeddings   = false;                          // rank_head answers through the head
+    enum llama_pooling_type pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED; // ... pooled as a rank score
+    size_t             n_seq        = 1;  // sequences that would go into one decode
+    size_t             n_tokens     = 0;  // ... and how many tokens that is
+};
 
-// How large a batch this plan wants, for a caller that is about to create a context: how many
-// sequences would go into one decode and how many tokens that is. Capped, because a 255-option
-// question should not demand a 255-sequence micro-batch. run_plan() then fits whatever context
-// it is actually given.
+// Capped, because a 255-option question should not demand a 255-sequence micro-batch.
+// run_plan() then fits whatever context it is actually given.
 constexpr size_t MAX_BATCHED_SEQS = 32;
-void plan_batch_hint(const plan & p, size_t & n_seq, size_t & n_tokens);
+
+context_needs required_context(const so_config & cfg, const plan & p);
 
 // Run a plan and get its answers. Which readout it is, how many decodes that costs and where
 // the numbers come from is the plan's business, not the caller's -- a front end that drives
