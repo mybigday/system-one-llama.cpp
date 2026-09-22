@@ -43,7 +43,12 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
 }
 #endif
 
+// GELU via a fp16 lookup table: fast, but it rounds the activation's input and output
+// through fp16, which costs ~5e-4 relative error per GELU. Define GGML_NO_GELU_FP16 to get
+// the exact f32 tanh formula instead (needed when matching a reference implementation).
+#ifndef GGML_NO_GELU_FP16
 #define GGML_GELU_FP16
+#endif
 #define GGML_GELU_QUICK_FP16
 
 #define GGML_SOFT_MAX_UNROLL 4
