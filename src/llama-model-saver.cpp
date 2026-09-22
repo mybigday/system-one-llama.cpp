@@ -20,6 +20,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_T5:
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DIFFUSION_GEMMA: // a per-layer SWA pattern add_kv_from_model cannot write back
             return false;
         default:
             return true;
