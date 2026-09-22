@@ -123,8 +123,6 @@ bool tokenize_segments(const llama_vocab * vocab,
                        tokenized & out,
                        std::string & err);
 
-// Single-pass tokenization of the whole prompt, for measuring what the split costs.
-std::vector<llama_token> tokenize_whole(const llama_vocab * vocab, const std::string & text, bool add_special);
 
 // Token ids of the label pieces, in `labels` order. Every label must be a single token, since
 // the answer is read as one position's distribution over them.

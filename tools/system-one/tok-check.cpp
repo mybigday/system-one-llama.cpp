@@ -12,6 +12,8 @@
 // used for experiments; without it the model's own GGUF template is authoritative.
 
 #include "system-one.h"
+
+#include "common.h"
 #include "nlohmann/json.hpp"
 
 #include <cstdio>
@@ -146,7 +148,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "error on item %zu: %s\n", ii, err.c_str());
             return 1;
         }
-        const auto t_whole = tokenize_whole(vocab, built, false);
+        const auto t_whole = common_tokenize(vocab, built, false, true);
 
         const int d_seg   = first_diff(t_seg.ids, ids_ref);
         const int d_whole = first_diff(t_whole,   ids_ref);

@@ -1,6 +1,7 @@
 #include "system-one.h"
 
 #include "chat.h"                 // pulls in the jinja engine the chat templates use
+#include "common.h"               // common_tokenize, string_split
 #include "json.h"
 
 #include <algorithm>
@@ -22,31 +23,16 @@ static bool meta_str(const llama_model * model, const char * key, std::string & 
     return true;
 }
 
-static void meta_int(const llama_model * model, const char * key, int & out) {
-    std::string s;
-    if (meta_str(model, key, s) && !s.empty()) out = std::atoi(s.c_str());
-}
-
-static void meta_float(const llama_model * model, const char * key, float & out) {
-    std::string s;
-    if (meta_str(model, key, s) && !s.empty()) out = std::strtof(s.c_str(), nullptr);
-}
-
-static void meta_bool(const llama_model * model, const char * key, bool & out) {
-    std::string s;
-    if (meta_str(model, key, s) && !s.empty()) out = (s == "true" || s == "1");
-}
-
 static std::vector<std::string> split_array(const std::string & s) {
     // llama.cpp stringifies a kv array as [a, b, c]
     std::vector<std::string> out;
-    std::string cur;
-    for (char c : s) {
-        if (c == '[' || c == ']' || c == '"' || c == ' ') continue;
-        if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); continue; }
-        cur += c;
+    for (auto & piece : string_split(s, ",")) {
+        std::string cur;
+        for (char c : piece) {
+            if (c != '[' && c != ']' && c != '"' && c != ' ') cur += c;
+        }
+        if (!cur.empty()) out.push_back(cur);
     }
-    if (!cur.empty()) out.push_back(cur);
     return out;
 }
 
@@ -234,20 +220,6 @@ bool render_pair_segments(const so_config & cfg,
 
 // ---------------------------------------------------------------- tokenization
 
-static std::vector<llama_token> encode(const llama_vocab * vocab, const std::string & text,
-                                       bool add_special, bool parse_special = false) {
-    if (text.empty()) return {};
-    int n = -llama_tokenize(vocab, text.data(), (int32_t) text.size(), nullptr, 0, add_special, parse_special);
-    std::vector<llama_token> out(n);
-    n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), out.data(), n, add_special, parse_special);
-    out.resize(std::max(0, n));
-    return out;
-}
-
-std::vector<llama_token> tokenize_whole(const llama_vocab * vocab, const std::string & text, bool add_special) {
-    return encode(vocab, text, add_special, true);
-}
-
 bool tokenize_segments(const llama_vocab * vocab,
                        const so_config & cfg,
                        const std::vector<std::string> & segments,
@@ -270,7 +242,7 @@ bool tokenize_segments(const llama_vocab * vocab,
     // the question blocks are the trailing segments
     const size_t first_question = segments.size() - n_questions;
     for (size_t i = 0; i < segments.size(); i++) {
-        const auto ids = encode(vocab, segments[i], false, true);
+        const auto ids = common_tokenize(vocab, segments[i], false, true);
         if (ids.empty()) {
             err = "segment " + std::to_string(i) + " tokenized to nothing";
             return false;
@@ -308,7 +280,7 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
     // reads the tokens a BPE vocab spells "ĠA", "ĠB", which no text comparison would find.
     out.assign(labels.size(), -1);
     for (size_t i = 0; i < labels.size(); i++) {
-        const auto ids = encode(vocab, labels[i], false, false);
+        const auto ids = common_tokenize(vocab, labels[i], false, false);
         if (ids.size() == 1) out[i] = ids[0];
     }
     return std::find(out.begin(), out.end(), -1) == out.end();
@@ -421,30 +393,13 @@ static std::vector<float> softmax(const std::vector<float> & x) {
     return p;
 }
 
-answer answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
-    answer a;
-    a.logits.resize(n_options);
-    for (int j = 0; j < n_options; j++) a.logits[j] = row[letter_ids[j]];
-    a.probs  = softmax(a.logits);
-    a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
-
-    // confidence = 1 - H(p)/ln K, as the Jev-compatible servers report it
-    if (n_options > 1) {
-        double h = 0.0;
-        for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
-        a.confidence = (float) (1.0 - h / std::log((double) n_options));
-    } else {
-        a.confidence = 1.0f;
-    }
-    return a;
-}
-
 answer answer_from_scores(const std::vector<float> & scores) {
     answer a;
     a.logits = scores;                 // the head's raw output, as the caller gets it
     a.probs  = softmax(scores);
     a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
 
+    // confidence = 1 - H(p)/ln K, as the Jev-compatible servers report it
     if (scores.size() > 1) {
         double h = 0.0;
         for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
@@ -453,6 +408,13 @@ answer answer_from_scores(const std::vector<float> & scores) {
         a.confidence = 1.0f;
     }
     return a;
+}
+
+answer answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
+    // the only difference between the two readouts is where the numbers come from
+    std::vector<float> scores(n_options);
+    for (int j = 0; j < n_options; j++) scores[j] = row[letter_ids[j]];
+    return answer_from_scores(scores);
 }
 
 float score_expectation(const answer & a) {
