@@ -16,6 +16,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_SYSTEM_ONE,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
@@ -153,6 +154,15 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // used by SERVER_TASK_TYPE_SYSTEM_ONE: the prompt positions whose next-token
+    // distribution is the answer, how many labels to read at each, and the label tokens
+    struct system_one_spec {
+        std::vector<int32_t>     slots;
+        std::vector<int32_t>     n_options;
+        std::vector<llama_token> letters;
+    };
+    system_one_spec system_one;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -197,6 +207,7 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_SYSTEM_ONE:
                 return true;
             default:
                 return false;
@@ -464,6 +475,19 @@ struct server_task_result_embd : server_task_result {
     json to_json_non_oaicompat();
 
     json to_json_oaicompat();
+};
+
+// One typed decision per question: the label logits, and the probabilities over them.
+// The route builds the Jev-shaped response from these, since it holds the request.
+struct server_task_result_system_one : server_task_result {
+    std::vector<std::vector<float>> logits;   // per question, n_options entries
+    std::vector<std::vector<float>> probs;
+    std::vector<int32_t>            choice;   // argmax per question
+    std::vector<float>              confidence;
+
+    int32_t n_tokens = 0;
+
+    virtual json to_json() override;
 };
 
 struct server_task_result_rerank : server_task_result {

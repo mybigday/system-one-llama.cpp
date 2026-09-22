@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "system-one.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -49,6 +50,14 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+
+    // a System One request reads one output per question out of a single sequence, all in
+    // the same decode, so its ceiling is set by the user rather than by speculation
+    if (params.n_outputs_max_per_seq > result.per_seq) {
+        result.per_seq = params.n_outputs_max_per_seq;
+        result.total   = std::max(result.total, result.per_seq * std::max(1, params.n_parallel));
+    }
+
     return result;
 }
 
@@ -254,6 +263,13 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+
+    // SERVER_TASK_TYPE_SYSTEM_ONE: this iteration's marked answer positions as
+    // (batch index -> question index), and the answers gathered so far. The answer slots
+    // sit inside the prompt, so they can be decoded in an earlier sub-batch than the one
+    // that finishes the prompt -- hence collecting as we go instead of reading at the end.
+    std::vector<std::pair<int32_t, int32_t>> so_outputs;
+    std::vector<system_one::answer>          so_answers;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -386,6 +402,8 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        so_outputs.clear();
+        so_answers.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -2194,6 +2212,31 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void send_system_one(const server_slot & slot) {
+        auto res = std::make_unique<server_task_result_system_one>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+
+        const size_t n_questions = slot.task->system_one.slots.size();
+        for (size_t qi = 0; qi < n_questions; qi++) {
+            if (qi >= slot.so_answers.size() || slot.so_answers[qi].probs.empty()) {
+                SLT_ERR(slot, "no answer collected for question %zu\n", qi);
+                send_error(slot, "System One: an answer slot was never decoded", ERROR_TYPE_SERVER);
+                return;
+            }
+            const auto & a = slot.so_answers[qi];
+            res->logits.push_back(a.logits);
+            res->probs.push_back(a.probs);
+            res->choice.push_back(a.choice);
+            res->confidence.push_back(a.confidence);
+        }
+
+        SLT_DBG(slot, "sending System One result for %zu question(s)\n", n_questions);
+
+        queue_results.send(std::move(res));
+    }
+
     void send_rerank(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
@@ -2384,6 +2427,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_SYSTEM_ONE:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -3588,6 +3632,21 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // System One: ask for the distribution at each answer slot that falls
+                    // into this chunk. Indices are per-iteration, so the map is rebuilt here.
+                    if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE) {
+                        const auto & so = slot.task->system_one;
+                        slot.so_outputs.clear();
+                        for (size_t qi = 0; qi < so.slots.size(); qi++) {
+                            const int32_t p = so.slots[qi];
+                            if (p >= n_tokens_start && p < n_tokens_start + n_tokens_cur) {
+                                const int32_t idx = (int32_t) (n_tokens_prev + (p - n_tokens_start));
+                                batch.set_output(idx, true);
+                                slot.so_outputs.emplace_back(idx, (int32_t) qi);
+                            }
+                        }
+                    }
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -3810,6 +3869,26 @@ private:
                 }
             }
 
+            // System One answers can be in any sub-batch, so collect them before the
+            // i_batch guard below (which only tracks the last prompt token)
+            if (slot.task && slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.so_outputs.empty()) {
+                const auto & so = slot.task->system_one;
+                if (slot.so_answers.size() != so.slots.size()) {
+                    slot.so_answers.assign(so.slots.size(), system_one::answer{});
+                }
+                for (const auto & [idx, qi] : slot.so_outputs) {
+                    if (!is_inside_view(idx) || !slot.so_answers[qi].probs.empty()) {
+                        continue;
+                    }
+                    const float * row = llama_get_logits_ith(ctx_tgt, idx - off);
+                    if (row == nullptr) {
+                        SLT_ERR(slot, "failed to get logits for answer slot %d\n", idx);
+                        continue;
+                    }
+                    slot.so_answers[qi] = system_one::answer_from_logits(row, so.letters, so.n_options[qi]);
+                }
+            }
+
             if (!is_inside_view(slot.i_batch)) {
                 // the required token not in this sub-batch, skip
                 return;
@@ -3826,6 +3905,13 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE) {
+                    send_system_one(slot);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -5219,6 +5305,244 @@ void server_routes::init_routes() {
             is_tei_format,
             documents,
             top_n);
+
+        res->ok(root);
+        return res;
+    };
+
+    // POST /v1/systemone -- System One typed decisions (Jev-compatible wire format).
+    //
+    // {"model": "...", "state": <string|object>, "questions": {
+    //     "<key>": {"type": "noul"|"choice"|"score", "instructions": "...",
+    //               "criteria": {...}|[...], "temperature": 1.0}},
+    //  "template": "<optional Jinja override>"}
+    //
+    // The prompt format comes from the model (`system_one.template`); a request template
+    // overrides it. Answers are the label distributions at each answer slot, and the raw
+    // logits are always returned so a caller can recalibrate on its own benchmark.
+    this->post_system_one = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        const json body = json::parse(req.body);
+
+        const bool has_tmpl_override = body.contains("template") && body.at("template").is_string();
+
+        system_one::so_config cfg;
+        std::string err;
+        if (!system_one::so_config::from_model(ctx_server.model_tgt, cfg, err)) {
+            if (!has_tmpl_override) {
+                res->error(format_error_response(err, ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            cfg = system_one::so_config();
+        }
+        if (has_tmpl_override) {
+            cfg.template_src = body.at("template").get<std::string>();
+        }
+
+        if (!body.contains("questions") || !body.at("questions").is_object()) {
+            res->error(format_error_response("\"questions\" must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // the state reaches the template as a string; an object is passed through as JSON
+        std::string state;
+        if (body.contains("state")) {
+            const json & st = body.at("state");
+            state = st.is_string() ? st.get<std::string>() : st.dump();
+        }
+
+        std::vector<std::string>            keys;
+        std::vector<std::string>            kinds;
+        std::vector<std::vector<std::string>> options;
+        std::vector<float>                  temperatures;
+        std::vector<system_one::question>   questions;
+
+        for (const auto & item : body.at("questions").items()) {
+            const std::string & key = item.key();
+            const json &        q   = item.value();
+            if (!q.is_object()) {
+                res->error(format_error_response("question \"" + key + "\" must be an object", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            const std::string type = json_value(q, "type", std::string("noul"));
+            system_one::question out;
+            out.text = json_value(q, "instructions", std::string());
+
+            if (type == "noul") {
+                out.k       = system_one::kind::noul;
+                out.options = cfg.noul_options;
+                if (q.contains("criteria") && q.at("criteria").is_object()) {
+                    // {"false": "...", "true": "..."} describes the two sides
+                    out.descs.assign(out.options.size(), std::string());
+                    const json & c = q.at("criteria");
+                    if (c.contains("false")) out.descs[0] = c.at("false").get<std::string>();
+                    if (c.contains("true") && out.descs.size() > 1) out.descs[1] = c.at("true").get<std::string>();
+                }
+            } else if (type == "choice") {
+                out.k = system_one::kind::choice;
+                if (!q.contains("criteria") || !q.at("criteria").is_object()) {
+                    res->error(format_error_response("choice question \"" + key + "\" needs a \"criteria\" object", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                for (const auto & c : q.at("criteria").items()) {
+                    out.options.push_back(c.key());
+                    out.descs.push_back(c.value().is_string() ? c.value().get<std::string>() : std::string());
+                }
+            } else if (type == "score") {
+                out.k = system_one::kind::score;
+                if (!q.contains("criteria") || !q.at("criteria").is_array()) {
+                    res->error(format_error_response("score question \"" + key + "\" needs a \"criteria\" array of levels", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                out.options = q.at("criteria").get<std::vector<std::string>>();
+            } else {
+                res->error(format_error_response("unknown question type \"" + type + "\" for \"" + key + "\"", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            if (out.options.size() < 2) {
+                res->error(format_error_response("question \"" + key + "\" needs at least two options", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (out.options.size() > cfg.letters.size()) {
+                // above one slot's label set the exact path is per-option scoring, which
+                // this route does not implement yet -- say so instead of approximating
+                res->error(format_error_response(
+                    "question \"" + key + "\" has " + std::to_string(out.options.size()) +
+                    " options; this readout supports at most " + std::to_string(cfg.letters.size()) +
+                    " (per-option mode for larger sets is not implemented yet)", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            keys.push_back(key);
+            kinds.push_back(type);
+            options.push_back(out.options);
+            temperatures.push_back(json_value(q, "temperature", 1.0f));
+            questions.push_back(std::move(out));
+        }
+
+        if (questions.empty()) {
+            res->error(format_error_response("\"questions\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // every question needs its own output slot in one decode; without headroom
+        // llama_decode would abort, so refuse with something actionable instead
+        const int max_per_seq = std::max(1, params.n_outputs_max_per_seq);
+        if ((int) questions.size() > max_per_seq) {
+            res->error(format_error_response(
+                "this server accepts at most " + std::to_string(max_per_seq) +
+                " question(s) per request; restart it with --n-outputs-max-per-seq " +
+                std::to_string(questions.size()) + " (or higher)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // render the model's template, then tokenize it the way the checkpoint was trained:
+        // segment by segment, so the seams match
+        state = system_one::truncate_state(ctx_server.vocab, cfg, state);
+        std::vector<std::string> segments;
+        if (!system_one::render_segments(cfg, state, questions, segments, err)) {
+            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        system_one::tokenized tok;
+        if (!system_one::tokenize_segments(ctx_server.vocab, cfg, segments, questions.size(), tok, err)) {
+            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::vector<llama_token> letter_ids;
+        if (!system_one::letter_tokens(ctx_server.vocab, cfg.letters, letter_ids)) {
+            res->error(format_error_response("this model's tokenizer has no single token for some label letter", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SYSTEM_ONE);
+            task.id     = rd.get_new_id();
+            task.tokens = server_tokens(tok.ids, false);
+            task.system_one.slots   = tok.slots;
+            task.system_one.letters = letter_ids;
+            for (const auto & q : questions) {
+                task.system_one.n_options.push_back((int32_t) q.options.size());
+            }
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res; // connection was closed
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * so_res = dynamic_cast<server_task_result_system_one *>(result.get());
+        GGML_ASSERT(so_res != nullptr);
+
+        json answers = json::object();
+        for (size_t qi = 0; qi < keys.size(); qi++) {
+            const auto & logits = so_res->logits[qi];
+
+            // an optional per-question temperature: the model ships already calibrated
+            // (T is folded into its weights), so this only exists for callers that
+            // recalibrate on their own distribution
+            std::vector<float> probs = so_res->probs[qi];
+            const float t = temperatures[qi];
+            if (t > 0.0f && std::fabs(t - 1.0f) > 1e-6f) {
+                std::vector<float> scaled(logits.size());
+                for (size_t j = 0; j < logits.size(); j++) scaled[j] = logits[j] / t;
+                const float mx = *std::max_element(scaled.begin(), scaled.end());
+                float sum = 0.0f;
+                for (size_t j = 0; j < scaled.size(); j++) { scaled[j] = std::exp(scaled[j] - mx); sum += scaled[j]; }
+                probs.resize(scaled.size());
+                for (size_t j = 0; j < scaled.size(); j++) probs[j] = scaled[j] / sum;
+            }
+
+            const size_t argmax = std::max_element(probs.begin(), probs.end()) - probs.begin();
+
+            double h = 0.0;
+            for (float p : probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
+            const float confidence = probs.size() > 1
+                ? (float) (1.0 - h / std::log((double) probs.size()))
+                : 1.0f;
+
+            json a = json::object();
+            if (kinds[qi] == "noul") {
+                // P(true): the last option is the affirmative one
+                a["noul"] = probs.back();
+            } else if (kinds[qi] == "choice") {
+                json per_option = json::object();
+                for (size_t j = 0; j < options[qi].size(); j++) {
+                    per_option[options[qi][j]] = probs[j];
+                }
+                a["choice"]        = options[qi][argmax];
+                a["probabilities"] = per_option;
+            } else {
+                double e = 0.0;
+                for (size_t j = 0; j < probs.size(); j++) e += (double) j * (double) probs[j];
+                a["score"]         = e;
+                a["legend"]        = options[qi];
+                a["probabilities"] = probs;
+            }
+            a["confidence"] = confidence;
+            a["logits"]     = logits;   // always returned: calibration is the caller's business
+
+            answers[keys[qi]] = a;
+        }
+
+        json root = json::object();
+        root["model"]   = meta->model_name;
+        root["answers"] = answers;
+        json usage = json::object();
+        usage["input_tokens"]  = so_res->n_tokens;
+        usage["output_tokens"] = 0;   // nothing is generated: that is the point
+        root["usage"] = usage;
 
         res->ok(root);
         return res;

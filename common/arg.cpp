@@ -1670,6 +1670,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
+        {"--n-outputs-max-per-seq"}, "N",
+        string_format("maximum outputs read from one sequence in a single decode (default: %d); "
+                      "raise it for System One requests, which read one output per question",
+                      params.n_outputs_max_per_seq),
+        [](common_params & params, int value) {
+            params.n_outputs_max_per_seq = value;
+        }
+    ).set_env("LLAMA_ARG_N_OUTPUTS_MAX_PER_SEQ"));
+    add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
         string_format("physical maximum batch size (default: %d)", params.n_ubatch),
         [](common_params & params, int value) {
