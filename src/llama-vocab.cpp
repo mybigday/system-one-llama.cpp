@@ -939,6 +939,12 @@ struct llm_tokenizer_ugm : llm_tokenizer {
             if (vocab.is_user_defined(id)) {
                 user_defined_token_matcher.insert(token_data.text.data(), token_data.text.size());
             }
+
+            // byte tokens are deliberately not in the token matcher -- they are reachable
+            // only as a fallback, never by matching their "<0xNN>" spelling in the input
+            if (vocab.is_byte(id)) {
+                has_byte_fallback = true;
+            }
         }
 
         unknown_token_score = min_score - unknown_token_score_penalty;
@@ -960,6 +966,10 @@ struct llm_tokenizer_ugm : llm_tokenizer {
 
     float unknown_token_score_penalty = 10.0;
     float unknown_token_score;
+
+    // true when the vocab carries <0xNN> byte tokens, i.e. the SentencePiece model was
+    // trained with byte_fallback. Vocabs without them (T5, XLM-RoBERTa) keep emitting unk.
+    bool has_byte_fallback = false;
 
     struct naive_trie token_matcher;
 };
@@ -1051,15 +1061,27 @@ struct llm_tokenizer_ugm_session {
         // now backtrack from the end to gather token ids of the best tokenization
         // merge sequences of consecutive unknown tokens into single unknown tokens
         bool is_prev_unknown = false;
+        size_t end_offset = input_len;
         for (struct best_tokenization & tokenization = tokenization_results[input_len]; ; tokenization = tokenization_results[tokenization.input_offset]) {
             bool is_unknown = tokenization.token_id == vocab.token_unk();
-            if (!(is_prev_unknown && is_unknown)) {
+            if (is_unknown && tokenizer.has_byte_fallback) {
+                // SentencePiece with byte_fallback spells an unmatched span as its raw
+                // bytes, one <0xNN> token per byte, and never merges them into a single
+                // unknown. Pushed back to front like everything else here; the reverse
+                // below puts them in order. Note this covers '\n' and '\t' for vocabs
+                // that do not have them as pieces, so it is not a rare-input path.
+                for (size_t i = end_offset; i > tokenization.input_offset; i--) {
+                    output.push_back(vocab.byte_to_token(normalized[i - 1]));
+                }
+                is_unknown = false;
+            } else if (!(is_prev_unknown && is_unknown)) {
                 output.push_back(tokenization.token_id);
             }
             if (tokenization.input_offset == 0) {
                 break;
             }
             is_prev_unknown = is_unknown;
+            end_offset = tokenization.input_offset;
         }
 
         // reverse the output since we added tokens starting from the end of the input
