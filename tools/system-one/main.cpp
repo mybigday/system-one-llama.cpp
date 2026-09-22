@@ -98,7 +98,13 @@ static bool collect_questions(const common_params & params,
             return false;
         }
         if (req.contains("state")) {
-            state = req.at("state").is_string() ? req.at("state").get<std::string>() : req.at("state").dump();
+            const json & st = req.at("state");
+            if (st.is_array()) {
+                // reserved for content parts carrying media; see the note in the spec
+                err = "\"state\" as a list of content parts is not supported yet -- pass a string or an object";
+                return false;
+            }
+            state = st.is_string() ? st.get<std::string>() : st.dump();
         }
         if (!req.contains("questions") || !req.at("questions").is_object()) {
             err = "request has no \"questions\" object";

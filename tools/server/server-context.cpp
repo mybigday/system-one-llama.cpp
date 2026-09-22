@@ -5402,6 +5402,14 @@ void server_routes::init_routes() {
         std::string state;
         if (body.contains("state")) {
             const json & st = body.at("state");
+        if (st.is_array()) {
+            // reserved for OpenAI-style content parts carrying media; dumping the array into
+            // the prompt as JSON text would be a silently wrong answer, so refuse instead
+            res->error(format_error_response(
+                "\"state\" as a list of content parts is not supported yet -- pass a string or an object",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
             state = st.is_string() ? st.get<std::string>() : st.dump();
         }
 
