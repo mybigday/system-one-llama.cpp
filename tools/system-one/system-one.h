@@ -36,38 +36,29 @@ struct question {
     std::vector<std::string> descs;     // empty, or one per option
 };
 
-// Everything the checkpoint declares about its own prompt and readout.
+// What the checkpoint says about its own prompt and readout. Three of these come from
+// `system_one.*` keys; the rest are standard GGUF metadata, because a mask token, a leading BOS
+// and an attention direction all have homes of their own already.
 struct so_config {
-    std::string template_src;                                   // system_one.template (required)
-    std::string segment_separator = "\x1e";
+    std::string template_src;                             // tokenizer.chat_template.system_one
+    std::string segment_separator = "\x1e";               // system_one.segment_separator
 
-    // where the answer sits in a question's segment, and what is read there:
-    //   last_token_of_question_segment + letter_slot  the next-token distribution after "("
-    //   mask_token_per_question        + masked_slot  the distribution at a mask token,
-    //                                                 which needs bidirectional attention
-    std::string slot_rule         = "last_token_of_question_segment";
-    std::string readout           = "letter_slot";
-    llama_token mask_token        = -1;     // system_one.mask_token_id
-    std::string mask_text;                  // system_one.mask_token, as the template writes it
-    std::string letters           = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    // system_one.readout: letter_slot reads the next-token distribution at the end of a
+    // question's segment, masked_slot reads the distribution at the mask token inside it
+    std::string readout = "letter_slot";
 
-    std::vector<std::string> noul_options = {"no", "yes"};   // P(true) is the last one
+    // system_one.labels: option i is labelled labels[i] and that token is what gets read
+    std::vector<std::string> labels;
 
-    std::string tag_noul   = "yes/no";
-    std::string tag_choice = "choice";
-    std::string tag_score  = "score";
+    // from the standard metadata
+    llama_token mask_token = -1;    // tokenizer.ggml.mask_token_id
+    std::string mask_text;          // its piece, so a template can write it
+    std::string bos_text;           // likewise for BOS: the template writes it, as chat
+    std::string eos_text;           // templates do, instead of a flag saying "prepend one"
 
-    int         max_state_tokens  = 0;    // 0 = never truncate
-    std::string truncation;               // e.g. "head0.7_tail_marker"
-    std::string truncation_marker;
-    float       head_fraction     = 0.7f;
-    int         tail_reserve      = 8;
+    bool masked() const { return readout == "masked_slot"; }
 
-    bool        add_bos           = true;
-    float       calibration_temperature = 1.0f;   // provenance only: already in the weights
-    bool        calibration_folded      = false;
-
-    // Reads `system_one.*` kv. Fails when the model carries no template.
+    // Reads the metadata. Fails when the model carries no System One template.
     static bool from_model(const llama_model * model, so_config & out, std::string & err);
 };
 
@@ -93,17 +84,13 @@ bool tokenize_segments(const llama_vocab * vocab,
                        tokenized & out,
                        std::string & err);
 
-// Cuts the state to `max_state_tokens` (head, marker, tail) before rendering, so the
-// rule stays independent of where the template puts the state. Returns the state
-// unchanged when it fits, which is the usual case.
-std::string truncate_state(const llama_vocab * vocab, const so_config & cfg, const std::string & state);
-
 // Single-pass tokenization of the whole prompt, for measuring what the split costs.
 std::vector<llama_token> tokenize_whole(const llama_vocab * vocab, const std::string & text, bool add_special);
 
-// Token ids of the single-character label pieces, in `letters` order.
-bool letter_tokens(const llama_vocab * vocab, const std::string & letters,
-                   std::vector<llama_token> & out);
+// Token ids of the label pieces, in `labels` order. Every label must be a single token, since
+// the answer is read as one position's distribution over them.
+bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
+                  std::vector<llama_token> & out);
 
 struct answer {
     int                choice = 0;      // argmax over the labels

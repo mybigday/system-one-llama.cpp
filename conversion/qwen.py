@@ -156,7 +156,7 @@ class Qwen2MoeModel(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
-@ModelBase.register("Qwen3ForCausalLM", "Qwen3Model", "A2DQwen3LMHeadModel")
+@ModelBase.register("Qwen3ForCausalLM", "Qwen3Model")
 @ModelBase.example("Qwen/Qwen3-8B")
 class Qwen3Model(Qwen2Model):
     model_arch = gguf.MODEL_ARCH.QWEN3
@@ -253,6 +253,21 @@ class Qwen3Model(Qwen2Model):
                 return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("A2DQwen3LMHeadModel")
+class A2DQwen3Model(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    """Masked-diffusion finetunes of Qwen3 (dllm-hub's A2D line).
+
+    Same tensors as Qwen3; the difference is that the model is trained to fill masked
+    positions, so it attends in both directions.
+    """
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_causal_attention(False)
 
 
 @ModelBase.register("Qwen3MoeForCausalLM")

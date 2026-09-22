@@ -37,69 +37,68 @@ static void meta_bool(const llama_model * model, const char * key, bool & out) {
     if (meta_str(model, key, s) && !s.empty()) out = (s == "true" || s == "1");
 }
 
+static std::vector<std::string> split_array(const std::string & s) {
+    // llama.cpp stringifies a kv array as [a, b, c]
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == '[' || c == ']' || c == '"' || c == ' ') continue;
+        if (c == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 bool so_config::from_model(const llama_model * model, so_config & out, std::string & err) {
-    if (!meta_str(model, "system_one.template", out.template_src) || out.template_src.empty()) {
-        err = "model has no system_one template (system_one.template); "
-              "convert the checkpoint with its system_one.json sidecar, or pass a template in the request";
+    const char * tmpl = llama_model_chat_template(model, "system_one");
+    if (tmpl == nullptr || tmpl[0] == '\0') {
+        err = "model has no System One template (tokenizer.chat_template.system_one); "
+              "convert it with its template, or pass one in the request";
         return false;
     }
+    out.template_src = tmpl;
 
     std::string s;
-    if (meta_str(model, "system_one.template.segment_separator", s) && !s.empty()) out.segment_separator = s;
-    if (meta_str(model, "system_one.slot",              s) && !s.empty()) out.slot_rule = s;
-    if (meta_str(model, "system_one.readout",           s) && !s.empty()) out.readout   = s;
-    if (meta_str(model, "system_one.letters",           s) && !s.empty()) out.letters   = s;
-    if (meta_str(model, "system_one.kind_tag.noul",     s) && !s.empty()) out.tag_noul   = s;
-    if (meta_str(model, "system_one.kind_tag.choice",   s) && !s.empty()) out.tag_choice = s;
-    if (meta_str(model, "system_one.kind_tag.score",    s) && !s.empty()) out.tag_score  = s;
-    meta_str(model, "system_one.truncation",        out.truncation);
-    // noul_options is a kv array; llama.cpp stringifies it, so accept the common forms
-    if (meta_str(model, "system_one.noul_options", s) && !s.empty()) {
-        std::vector<std::string> parsed;
-        std::string cur;
-        for (char ch : s) {
-            if (ch == '[' || ch == ']' || ch == '"' || ch == ' ') continue;
-            if (ch == ',') { if (!cur.empty()) parsed.push_back(cur); cur.clear(); continue; }
-            cur += ch;
+    if (meta_str(model, "system_one.readout", s) && !s.empty()) out.readout = s;
+    if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
+    if (meta_str(model, "system_one.labels", s) && !s.empty()) out.labels = split_array(s);
+
+    if (out.labels.empty()) {
+        // the usual alphabet, so a plain letter format needs no key at all
+        for (char c = 'A'; c <= 'Z'; c++) out.labels.push_back(std::string(1, c));
+        for (char c = 'a'; c <= 'z'; c++) out.labels.push_back(std::string(1, c));
+    }
+
+    if (out.readout != "letter_slot" && out.readout != "masked_slot") {
+        err = "unsupported system_one.readout: " + out.readout;
+        return false;
+    }
+
+    // the rest is ordinary model metadata
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    auto piece = [&](llama_token id) {
+        const char * t = id >= 0 ? llama_vocab_get_text(vocab, id) : nullptr;
+        return t ? std::string(t) : std::string();
+    };
+    out.bos_text = piece(llama_vocab_bos(vocab));
+    out.eos_text = piece(llama_vocab_eos(vocab));
+
+    if (out.masked()) {
+        out.mask_token = llama_vocab_mask(vocab);
+        if (out.mask_token < 0) {
+            err = "masked_slot needs the model's tokenizer.ggml.mask_token_id";
+            return false;
         }
-        if (!cur.empty()) parsed.push_back(cur);
-        if (parsed.size() >= 2) out.noul_options = parsed;
-    }
-    meta_str(model, "system_one.truncation_marker", out.truncation_marker);
-    meta_int  (model, "system_one.max_state_tokens", out.max_state_tokens);
-    meta_bool (model, "system_one.bos",              out.add_bos);
-    meta_float(model, "system_one.calibration_temperature", out.calibration_temperature);
-    meta_bool (model, "system_one.calibration_folded",      out.calibration_folded);
-
-    if (meta_str(model, "system_one.mask_token", s) && !s.empty()) out.mask_text = s;
-    {
-        int id = -1;
-        meta_int(model, "system_one.mask_token_id", id);
-        out.mask_token = (llama_token) id;
+        const char * piece = llama_vocab_get_text(vocab, out.mask_token);
+        out.mask_text = piece ? piece : "";
     }
 
-    const bool letter = out.readout == "letter_slot"  && out.slot_rule == "last_token_of_question_segment";
-    const bool masked = out.readout == "masked_slot"  && out.slot_rule == "mask_token_per_question";
-    if (!letter && !masked) {
-        err = "unsupported System One readout/slot combination: " + out.readout + " / " + out.slot_rule;
-        return false;
-    }
-    if (masked && out.mask_token < 0) {
-        err = "masked_slot needs system_one.mask_token_id";
-        return false;
-    }
     return true;
 }
 
 // ---------------------------------------------------------------- rendering
-
-static const std::string & tag_of(const so_config & cfg, kind k) {
-    switch (k) {
-        case kind::choice: return cfg.tag_choice;
-        case kind::score:  return cfg.tag_score;
-        default:           return cfg.tag_noul;
-    }
-}
 
 static const char * kind_name(kind k) {
     switch (k) {
@@ -126,15 +125,14 @@ bool render_segments(const so_config & cfg,
         for (size_t j = 0; j < q.options.size(); j++) {
             const bool has_desc = j < q.descs.size() && !q.descs[j].empty();
             options.push_back(json{
-                {"letter", j < cfg.letters.size() ? std::string(1, cfg.letters[j]) : std::string("?")},
+                {"label",  j < cfg.labels.size() ? cfg.labels[j] : std::string("?")},
                 {"option", q.options[j]},
                 {"desc",   has_desc ? json(q.descs[j]) : json(nullptr)},
             });
         }
         questions.push_back(json{
-            {"k",       (int) i + 1},          // 1-based, as the template expects
+            {"k",       (int) i + 1},          // 1-based, as templates count questions
             {"kind",    kind_name(q.k)},
-            {"tag",     tag_of(cfg, q.k)},
             {"text",    q.text},
             {"options", options},
         });
@@ -151,7 +149,9 @@ bool render_segments(const so_config & cfg,
             {"state",     state},
             {"questions", questions},
             {"sep",       cfg.segment_separator},
-            {"mask",      cfg.mask_text},     // empty unless the format places a mask token
+            {"mask",      cfg.mask_text},      // empty unless the format places a mask token
+            {"bos_token", cfg.bos_text},       // as a chat template gets them: the prompt says
+            {"eos_token", cfg.eos_text},       // where they go, no flag decides it
         };
         jinja::global_from_json(ctx, inp, false);
 
@@ -205,30 +205,6 @@ std::vector<llama_token> tokenize_whole(const llama_vocab * vocab, const std::st
     return encode(vocab, text, add_special, true);
 }
 
-std::string truncate_state(const llama_vocab * vocab, const so_config & cfg, const std::string & state) {
-    if (cfg.max_state_tokens <= 0) return state;
-
-    const auto ids = encode(vocab, state, false);
-    if ((int) ids.size() <= cfg.max_state_tokens) return state;
-
-    const int head = (int) (cfg.max_state_tokens * cfg.head_fraction);
-    const int tail = cfg.max_state_tokens - head - cfg.tail_reserve;
-
-    // round-trips through the tokenizer, so the cut text may not be byte-identical to a
-    // substring of the original -- acceptable, and only on this path
-    auto detok = [&](const llama_token * p, int n) {
-        if (n <= 0) return std::string();
-        int need = -llama_detokenize(vocab, p, n, nullptr, 0, false, false);
-        std::vector<char> buf(need + 1);
-        const int got = llama_detokenize(vocab, p, n, buf.data(), buf.size(), false, false);
-        return got > 0 ? std::string(buf.data(), got) : std::string();
-    };
-
-    std::string out = detok(ids.data(), head) + cfg.truncation_marker;
-    if (tail > 0) out += detok(ids.data() + ids.size() - tail, tail);
-    return out;
-}
-
 bool tokenize_segments(const llama_vocab * vocab,
                        const so_config & cfg,
                        const std::vector<std::string> & segments,
@@ -242,17 +218,16 @@ bool tokenize_segments(const llama_vocab * vocab,
 
     out.ids.clear();
     out.slots.clear();
-    if (cfg.add_bos) out.ids.push_back(llama_vocab_bos(vocab));
 
-    // the mask token is written into the template as text, so it has to be parsed back into
-    // its id; HF's tokenizers split on added tokens regardless of add_special_tokens, so this
-    // matches the reference. The letter-slot path keeps parse_special off, as validated.
-    const bool masked = cfg.slot_rule == "mask_token_per_question";
+    // Special tokens -- BOS, a mask -- are written into the template as text and have to parse
+    // back to their ids. HF's tokenizers split on added and special tokens regardless of
+    // add_special_tokens, so parsing them is what matches the reference.
+    const bool masked = cfg.masked();
 
     // the question blocks are the trailing segments
     const size_t first_question = segments.size() - n_questions;
     for (size_t i = 0; i < segments.size(); i++) {
-        const auto ids = encode(vocab, segments[i], false, masked);
+        const auto ids = encode(vocab, segments[i], false, true);
         if (ids.empty()) {
             err = "segment " + std::to_string(i) + " tokenized to nothing";
             return false;
@@ -282,15 +257,16 @@ bool tokenize_segments(const llama_vocab * vocab,
     return true;
 }
 
-bool letter_tokens(const llama_vocab * vocab, const std::string & letters,
-                   std::vector<llama_token> & out) {
+bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
+                  std::vector<llama_token> & out) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
-    out.assign(letters.size(), -1);
+    out.assign(labels.size(), -1);
     for (llama_token id = 0; id < n_vocab; id++) {
         const char * txt = llama_vocab_get_text(vocab, id);
-        if (!txt || strlen(txt) != 1) continue;
-        const size_t pos = letters.find(txt[0]);
-        if (pos != std::string::npos && out[pos] < 0) out[pos] = id;
+        if (!txt) continue;
+        for (size_t i = 0; i < labels.size(); i++) {
+            if (out[i] < 0 && labels[i] == txt) out[i] = id;
+        }
     }
     return std::find(out.begin(), out.end(), -1) == out.end();
 }

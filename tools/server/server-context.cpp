@@ -5395,8 +5395,10 @@ void server_routes::init_routes() {
             out.text = json_value(q, "instructions", std::string());
 
             if (type == "noul") {
+                // the two sides of a yes/no question are an API convention, not a model fact:
+                // a caller can name them through criteria, and the template can word them
                 out.k       = system_one::kind::noul;
-                out.options = cfg.noul_options;
+                out.options = {"no", "yes"};
                 if (q.contains("criteria") && q.at("criteria").is_object()) {
                     // {"false": "...", "true": "..."} describes the two sides
                     out.descs.assign(out.options.size(), std::string());
@@ -5430,12 +5432,12 @@ void server_routes::init_routes() {
                 res->error(format_error_response("question \"" + key + "\" needs at least two options", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            if (out.options.size() > cfg.letters.size()) {
+            if (out.options.size() > cfg.labels.size()) {
                 // above one slot's label set the exact path is per-option scoring, which
                 // this route does not implement yet -- say so instead of approximating
                 res->error(format_error_response(
                     "question \"" + key + "\" has " + std::to_string(out.options.size()) +
-                    " options; this readout supports at most " + std::to_string(cfg.letters.size()) +
+                    " options; this readout supports at most " + std::to_string(cfg.labels.size()) +
                     " (per-option mode for larger sets is not implemented yet)", ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
@@ -5467,7 +5469,6 @@ void server_routes::init_routes() {
 
         // render the model's template, then tokenize it the way the checkpoint was trained:
         // segment by segment, so the seams match
-        state = system_one::truncate_state(ctx_server.vocab, cfg, state);
         std::vector<std::string> segments;
         if (!system_one::render_segments(cfg, state, questions, segments, err)) {
             res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
@@ -5480,9 +5481,9 @@ void server_routes::init_routes() {
             return res;
         }
 
-        std::vector<llama_token> letter_ids;
-        if (!system_one::letter_tokens(ctx_server.vocab, cfg.letters, letter_ids)) {
-            res->error(format_error_response("this model's tokenizer has no single token for some label letter", ERROR_TYPE_NOT_SUPPORTED));
+        std::vector<llama_token> label_ids;
+        if (!system_one::label_tokens(ctx_server.vocab, cfg.labels, label_ids)) {
+            res->error(format_error_response("a label in this model's system_one.labels is not a single token", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 
@@ -5492,7 +5493,7 @@ void server_routes::init_routes() {
             task.id     = rd.get_new_id();
             task.tokens = server_tokens(tok.ids, false);
             task.system_one.slots   = tok.slots;
-            task.system_one.letters = letter_ids;
+            task.system_one.letters = label_ids;
             // bidirectional readouts read from inside the canvas; no prefix is reusable
             task.system_one.no_prefix_reuse = cfg.readout != "letter_slot";
             for (const auto & q : questions) {

@@ -101,9 +101,9 @@ int main(int argc, char ** argv) {
     std::string err;
     if (!so_config::from_model(model, cfg, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
 
-    std::vector<llama_token> letter_ids;
-    if (!letter_tokens(vocab, cfg.letters, letter_ids)) {
-        fprintf(stderr, "error: the label set has a letter without a single-token piece\n");
+    std::vector<llama_token> label_ids;
+    if (!label_tokens(vocab, cfg.labels, label_ids)) {
+        fprintf(stderr, "error: a label in system_one.labels is not a single token\n");
         return 1;
     }
 
@@ -126,7 +126,7 @@ int main(int argc, char ** argv) {
             qs.push_back(std::move(o));
         }
 
-        const std::string state = truncate_state(vocab, cfg, it.at("state").get<std::string>());
+        const std::string state = it.at("state").get<std::string>();
         std::vector<std::string> segs;
         if (!render_segments(cfg, state, qs, segs, err)) { fprintf(stderr, "item %zu: %s\n", ii, err.c_str()); return 1; }
 
@@ -154,7 +154,7 @@ int main(int argc, char ** argv) {
     const bool gelu_exact = ggml_gelu_is_exact();
     printf("build: gelu=%s  kv=%s  flash_attn=%s  threads=%d\n",
            gelu_exact ? "exact-f32" : "fp16-table", kv_f32 ? "f32" : "f16", use_fa ? "on" : "off", nthreads);
-    printf("readout: %s (%s), attention from the model\n", cfg.readout.c_str(), cfg.slot_rule.c_str());
+    printf("readout: %s, %zu labels, attention from the model\n", cfg.readout.c_str(), cfg.labels.size());
     printf("ids come from our own tokenizer (the golden's input_ids are not used)\n");
 
     double sum_dl = 0, max_dl = 0, sum_dp = 0, max_dp = 0;
@@ -165,7 +165,7 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(ctx), true);
 
         std::vector<answer> answers;
-        if (!read_slots(ctx, prep[ii].t, prep[ii].n_options, letter_ids, answers, err)) {
+        if (!read_slots(ctx, prep[ii].t, prep[ii].n_options, label_ids, answers, err)) {
             fprintf(stderr, "item %zu: %s\n", ii, err.c_str());
             return 1;
         }

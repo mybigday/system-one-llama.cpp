@@ -78,14 +78,13 @@ int main(int argc, char ** argv) {
         cfg.template_src = src;
         printf("template overridden from %s\n", template_file.c_str());
     }
-    printf("template: %zu bytes, sep=U+%04X, slot=%s, readout=%s, bos=%d, max_state_tokens=%d\n",
+    printf("template: %zu bytes, sep=U+%04X, readout=%s\n",
            cfg.template_src.size(), (unsigned) (unsigned char) cfg.segment_separator[0],
-           cfg.slot_rule.c_str(), cfg.readout.c_str(), (int) cfg.add_bos, cfg.max_state_tokens);
-    printf("calibration: T=%.4f folded=%d\n", cfg.calibration_temperature, (int) cfg.calibration_folded);
+           cfg.readout.c_str());
 
-    std::vector<llama_token> letter_ids;
-    printf("letters: %s\n", letter_tokens(vocab, cfg.letters, letter_ids)
-           ? "all are single tokens" : "MISSING single-token pieces");
+    std::vector<llama_token> label_ids;
+    printf("labels: %zu, %s\n", cfg.labels.size(), label_tokens(vocab, cfg.labels, label_ids)
+           ? "all single tokens" : "MISSING single-token pieces");
 
     const size_t n = (limit > 0 && (size_t) limit < items.size()) ? (size_t) limit : items.size();
     int ok_text = 0, ok_seg = 0, ok_whole = 0, ok_slots = 0;
@@ -111,7 +110,7 @@ int main(int argc, char ** argv) {
             slots_ref.push_back(q.at("slot_pos").get<int>());
         }
 
-        const std::string state = truncate_state(vocab, cfg, it.at("state").get<std::string>());
+        const std::string state = it.at("state").get<std::string>();
         std::vector<std::string> segs;
         if (!render_segments(cfg, state, qs, segs, err)) {
             fprintf(stderr, "error on item %zu: %s\n", ii, err.c_str());
@@ -120,10 +119,8 @@ int main(int argc, char ** argv) {
         std::string built;
         for (const auto & seg : segs) built += seg;
 
-        // the golden's prompt_text renders the BOS token; compare the rest
-        std::string ref_text = it.at("prompt_text").get<std::string>();
-        const std::string bos_piece = piece(vocab, llama_vocab_bos(vocab));
-        if (ref_text.rfind(bos_piece, 0) == 0) ref_text.erase(0, bos_piece.size());
+        // the template writes BOS itself, so prompt_text is compared whole
+        const std::string ref_text = it.at("prompt_text").get<std::string>();
         const bool text_eq = (built == ref_text);
         ok_text += text_eq;
 
@@ -133,7 +130,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "error on item %zu: %s\n", ii, err.c_str());
             return 1;
         }
-        const auto t_whole = tokenize_whole(vocab, built, cfg.add_bos);
+        const auto t_whole = tokenize_whole(vocab, built, false);
 
         const int d_seg   = first_diff(t_seg.ids, ids_ref);
         const int d_whole = first_diff(t_whole,   ids_ref);

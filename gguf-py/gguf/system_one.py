@@ -4,45 +4,36 @@ import logging
 import re
 from typing import Any, Iterator
 
+from .constants import Keys
+
 logger = logging.getLogger(__name__)
 
-# System One metadata: the keys a Jev-style typed-decision checkpoint carries in its GGUF, so
-# that a runtime can build the prompt and read the answers without being told out of band.
+# System One metadata: what a runtime must know about a Jev-style typed-decision checkpoint and
+# cannot get from the weights or from the standard GGUF keys.
 #
-# The values can come from a `system_one.json` sidecar (our export convention), from
-# convert_hf_to_gguf.py's --system-one KEY=VALUE, or be written into an existing GGUF with
-# gguf_set_system_one.py. The runtime only ever reads the kv; the sidecar is never required.
+# Deliberately small. Anything the standard metadata already carries is read from there, and
+# anything about how the prompt *looks* belongs in the template rather than in a key:
 #
-# The full semantics are in docs/SYSTEM_ONE_GGUF_SPEC.md.
+#   the prompt template   tokenizer.chat_template.system_one  (a named chat template)
+#   the mask token        tokenizer.ggml.mask_token_id
+#   the leading BOS       tokenizer.ggml.add_bos_token
+#   bidirectional or not  {arch}.attention.causal
+#
+# See docs/SYSTEM_ONE_GGUF_SPEC.md.
+
+TEMPLATE_NAME = "system_one"
+TEMPLATE_KEY = Keys.Tokenizer.CHAT_TEMPLATE_N.format(name=TEMPLATE_NAME)
+
 SCHEMA: dict[str, str] = {
-    "system_one.version":                    "int",
-    "system_one.template":                   "str",    # Jinja, rendered with trim_blocks and
-                                                       # lstrip_blocks (the chat-template convention)
-    "system_one.template.segment_separator": "str",    # marks the tokenizer seams in the render
-    "system_one.readout":                    "str",    # letter_slot | masked_slot
-    "system_one.slot":                       "str",    # last_token_of_question_segment |
-                                                       # mask_token_per_question
-    "system_one.letters":                    "str",
-    "system_one.mask_token_id":              "int",    # required by masked_slot
-    "system_one.mask_token":                 "str",    # how the template writes it
-    "system_one.attention":                  "str",    # "bidirectional" also sets attention.causal
-    "system_one.noul_options":               "array",
-    "system_one.kind_tag.choice":            "str",
-    "system_one.kind_tag.noul":              "str",
-    "system_one.kind_tag.score":             "str",
-    "system_one.max_state_tokens":           "int",
-    "system_one.truncation":                 "str",
-    "system_one.truncation_marker":          "str",
-    "system_one.bos":                        "bool",
-    "system_one.calibration_temperature":    "float",  # provenance: already folded into the weights
-    "system_one.calibration_folded":         "bool",
-    "system_one.source_run":                 "str",
+    "system_one.readout":           "str",    # letter_slot | masked_slot -- this also says where
+                                              # the answer sits, so there is no second key for it
+    "system_one.labels":            "array",  # the answer alphabet: option i is labelled
+                                              # labels[i], and that token is what gets read
+    "system_one.segment_separator": "str",    # marks the tokenizer seams in the render;
+                                              # defaults to U+001E when absent
 }
 
-# describe the format for a reader, mean nothing to a runtime, and are not written
-DOC_ONLY = {"system_one.template.render", "system_one.template.vars"}
-
-REQUIRED = ("system_one.template", "system_one.readout", "system_one.slot")
+REQUIRED = ("system_one.readout",)
 
 _ESCAPES = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[nrt0\\])")
 
@@ -51,14 +42,13 @@ def unescape(value: str) -> str:
     """Decode the escapes a shell cannot type, leaving everything else (UTF-8 included) alone."""
     def sub(m: re.Match[str]) -> str:
         tok = m.group(1)
-        if tok[0] == "x" or tok[0] == "u":
+        if tok[0] in "xu":
             return chr(int(tok[1:], 16))
         return {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\"}[tok]
     return _ESCAPES.sub(sub, value)
 
 
 def flatten(prefix: str, value: Any) -> Iterator[tuple[str, Any]]:
-    """A sidecar may nest (kind_tag: {choice: ...}); the kv namespace is flat."""
     if isinstance(value, dict):
         for k, v in value.items():
             yield from flatten(f"{prefix}.{k}" if prefix else str(k), v)
@@ -67,64 +57,53 @@ def flatten(prefix: str, value: Any) -> Iterator[tuple[str, Any]]:
 
 
 def coerce(key: str, value: Any, *, from_text: bool = False) -> Any:
-    kind = SCHEMA.get(key)
-    if kind is None:
-        logger.warning(f"system_one: {key} is not in the spec, treating it as a string")
-        kind = "str"
+    kind = SCHEMA.get(key, "str")
     if not isinstance(value, str):
         return value
     if from_text:
         value = unescape(value)
-    if kind == "int":
-        return int(value, 0)
-    if kind == "float":
-        return float(value)
-    if kind == "bool":
-        low = value.lower()
-        if low in ("true", "1", "yes", "on"):
-            return True
-        if low in ("false", "0", "no", "off"):
-            return False
-        raise ValueError(f"{key}: expected a boolean, got {value!r}")
     if kind == "array":
         return [v for v in value.split(",") if v]
     return value
 
 
-def check_required(values: dict[str, Any]) -> None:
+def write(writer, values: dict[str, Any], *, from_text: bool = False) -> int:
+    """Write System One metadata onto a GGUFWriter; returns how many keys were written.
+
+    `system_one.template` is accepted as the input spelling and stored where prompt templates
+    belong: the named chat template `system_one`.
+    """
+    values = dict(values)
+    template = values.pop("system_one.template", None)
+
+    if template is None and not any(k in SCHEMA for k in values):
+        return 0
+
     missing = [k for k in REQUIRED if k not in values]
     if missing:
         raise ValueError(f"System One metadata is incomplete, missing: {', '.join(missing)}")
 
-
-def write(writer, values: dict[str, Any], *, from_text: bool = False) -> int:
-    """Write the kv onto a GGUFWriter. Returns how many keys were written.
-
-    A bidirectional readout also sets the standard attention.causal key, because that is what
-    the loader reads -- system_one.attention alone would leave the model running causally.
-    """
-    check_required(values)
-
-    if values.get("system_one.attention") == "bidirectional":
-        logger.info("system_one: bidirectional attention -> attention.causal = False")
-        writer.add_causal_attention(False)
-
     written = 0
+    if template is not None:
+        # writes tokenizer.chat_template.system_one and lists the name in
+        # tokenizer.chat_templates, without touching the model's default chat template
+        writer.add_chat_template([{"name": TEMPLATE_NAME, "template": template}])
+        written += 1
+
     for key, val in values.items():
-        if key in DOC_ONLY:
-            continue
         if not key.startswith("system_one."):
             logger.warning(f"system_one: skipping key outside the namespace: {key}")
             continue
+        if key not in SCHEMA:
+            logger.warning(
+                f"system_one: {key} is not part of the spec and the runtime ignores it. "
+                f"Prompt wording belongs in the template; the mask token, BOS and attention "
+                f"direction have standard keys of their own."
+            )
+            continue
 
         val = coerce(key, val, from_text=from_text)
-        if isinstance(val, bool):
-            writer.add_bool(key, val)
-        elif isinstance(val, int):
-            writer.add_uint32(key, val)
-        elif isinstance(val, float):
-            writer.add_float32(key, val)
-        elif isinstance(val, str):
+        if isinstance(val, str):
             writer.add_string(key, val)
         elif isinstance(val, list) and all(isinstance(v, str) for v in val):
             writer.add_array(key, val)
