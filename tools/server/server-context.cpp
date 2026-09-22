@@ -2217,6 +2217,7 @@ private:
         res->id       = slot.task->id;
         res->index    = slot.task->index;
         res->n_tokens = slot.task->n_tokens();
+        res->n_cached = slot.stats.n_prompt_cached;
 
         const size_t n_questions = slot.task->system_one.slots.size();
         for (size_t qi = 0; qi < n_questions; qi++) {
@@ -3440,6 +3441,20 @@ private:
                                         ++it;
                                     }
                                 }
+                            }
+                        }
+
+                        // System One reads its answers from inside the prompt, so the reusable
+                        // prefix must stop before the first answer slot -- otherwise that slot is
+                        // never decoded and has no logits. The state precedes the questions, so a
+                        // growing transcript still reuses everything up to where it changed.
+                        if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.task->system_one.slots.empty()) {
+                            const auto & so_slots = slot.task->system_one.slots;
+                            const int32_t first_answer = *std::min_element(so_slots.begin(), so_slots.end());
+                            if (n_past > first_answer) {
+                                SLT_DBG(slot, "capping prompt reuse at the first answer slot (n_past = %d -> %d)\n",
+                                        n_past, first_answer);
+                                n_past = first_answer;
                             }
                         }
 
@@ -5542,6 +5557,7 @@ void server_routes::init_routes() {
         json usage = json::object();
         usage["input_tokens"]  = so_res->n_tokens;
         usage["output_tokens"] = 0;   // nothing is generated: that is the point
+        usage["cached_tokens"] = so_res->n_cached;   // prefix served from the KV cache
         root["usage"] = usage;
 
         res->ok(root);

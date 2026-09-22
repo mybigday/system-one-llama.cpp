@@ -486,6 +486,7 @@ struct server_task_result_system_one : server_task_result {
     std::vector<float>              confidence;
 
     int32_t n_tokens = 0;
+    int32_t n_cached = 0;   // prompt tokens served from the KV cache
 
     virtual json to_json() override;
 };

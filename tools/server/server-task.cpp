@@ -1514,6 +1514,7 @@ json server_task_result_system_one::to_json() {
         {"index",            index},
         {"answers",          answers},
         {"tokens_evaluated", n_tokens},
+        {"tokens_cached",    n_cached},
     };
 }
 
