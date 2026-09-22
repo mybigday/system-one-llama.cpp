@@ -435,6 +435,101 @@ float score_expectation(const answer & a) {
     return (float) e;
 }
 
+void apply_context_params(const so_config & cfg, llama_context_params & cparams) {
+    if (cfg.ranked()) {
+        // the answer is the classification head's output, which is reached as a pooled
+        // embedding -- so the context has to compute embeddings, pooled as a rank score
+        cparams.embeddings   = true;
+        cparams.pooling_type = LLAMA_POOLING_TYPE_RANK;
+    }
+}
+
+void plan_batch_hint(const plan & p, size_t & n_seq, size_t & n_tokens) {
+    n_seq    = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
+    n_tokens = 0;
+    for (size_t i = 0; i < n_seq; i++) {
+        n_tokens += p.sequences[i].tok.ids.size();
+    }
+}
+
+// rank_head scores one sequence per option through the model's classification head. They are
+// independent, so they go into as few decodes as the context allows rather than one each.
+// Two limits set the chunk size, and both are asked of the context rather than assumed: a
+// sequence needs a seq_id of its own, and a bidirectional model cannot have a sequence split
+// across ubatches, so a whole chunk has to fit in one.
+static bool score_sequences(llama_context * ctx, const plan & p,
+                            std::vector<float> & scores, std::string & err) {
+    const uint32_t n_ubatch  = llama_n_ubatch(ctx);
+    const uint32_t n_seq_max = llama_n_seq_max(ctx);
+
+    scores.assign(p.sequences.size(), 0.0f);
+
+    for (size_t i = 0; i < p.sequences.size(); ) {
+        size_t n_seq = 0;
+        size_t n_tok = 0;
+        while (i + n_seq < p.sequences.size() && n_seq < n_seq_max) {
+            const size_t len = p.sequences[i + n_seq].tok.ids.size();
+            if (len > n_ubatch) {
+                err = "one option sequence is " + std::to_string(len) +
+                      " tokens, more than the micro-batch (" + std::to_string(n_ubatch) +
+                      ") -- raise -ub";
+                return false;
+            }
+            if (n_tok + len > n_ubatch) {
+                break;
+            }
+            n_tok += len;
+            n_seq++;
+        }
+
+        llama_memory_clear(llama_get_memory(ctx), true);
+
+        llama_batch batch = llama_batch_init((int32_t) n_tok, 0, (int32_t) n_seq);
+        batch.n_tokens = (int32_t) n_tok;
+        size_t at = 0;
+        for (size_t k = 0; k < n_seq; k++) {
+            const auto & ids = p.sequences[i + k].tok.ids;
+            for (size_t j = 0; j < ids.size(); j++, at++) {
+                batch.token[at]     = ids[j];
+                batch.pos[at]       = (llama_pos) j;
+                batch.n_seq_id[at]  = 1;
+                batch.seq_id[at][0] = (llama_seq_id) k;
+                batch.logits[at]    = 1;
+            }
+        }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            err = "llama_decode failed on the batch starting at sequence " + std::to_string(i);
+            return false;
+        }
+
+        for (size_t k = 0; k < n_seq; k++) {
+            const float * out = llama_get_embeddings_seq(ctx, (llama_seq_id) k);
+            if (out == nullptr) {
+                err = "the model returned no pooled score -- is it a classification head?";
+                return false;
+            }
+            scores[i + k] = out[0];
+        }
+
+        i += n_seq;
+    }
+    return true;
+}
+
+bool run_plan(llama_context * ctx, const plan & p, std::vector<answer> & out, std::string & err) {
+    if (p.sequences.empty()) {
+        err = "an empty plan has nothing to run";
+        return false;
+    }
+    if (p.rank_pooling) {
+        std::vector<float> scores;
+        return score_sequences(ctx, p, scores, err) && answers_from_scores(p, scores, out, err);
+    }
+    return read_slots(ctx, p.sequences.front().tok, p.n_options, p.labels, out, err);
+}
+
 bool read_slots(llama_context * ctx,
                 const tokenized & t,
                 const std::vector<int> & n_options,

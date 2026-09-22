@@ -155,7 +155,26 @@ answer answer_from_scores(const std::vector<float> & scores);
 bool answers_from_scores(const plan & p, const std::vector<float> & scores,
                          std::vector<answer> & out, std::string & err);
 
-// One llama_decode over `t.ids`, then the label logits at every slot.
+// What the readout requires of a context. Everything else about it -- threads, context length,
+// where it runs -- is the caller's business; this is only the part the checkpoint dictates.
+void apply_context_params(const so_config & cfg, llama_context_params & cparams);
+
+// How large a batch this plan wants, for a caller that is about to create a context: how many
+// sequences would go into one decode and how many tokens that is. Capped, because a 255-option
+// question should not demand a 255-sequence micro-batch. run_plan() then fits whatever context
+// it is actually given.
+constexpr size_t MAX_BATCHED_SEQS = 32;
+void plan_batch_hint(const plan & p, size_t & n_seq, size_t & n_tokens);
+
+// Run a plan and get its answers. Which readout it is, how many decodes that costs and where
+// the numbers come from is the plan's business, not the caller's -- a front end that drives
+// llama_decode directly calls this and never branches on the readout. (The server does not:
+// it dispatches through its own scheduler, and branches on plan.rank_pooling the way the rest
+// of tools/server branches on a capability.)
+bool run_plan(llama_context * ctx, const plan & p, std::vector<answer> & out, std::string & err);
+
+// One llama_decode over `t.ids`, then the label logits at every slot. run_plan() calls this
+// for the slot readouts; it stays public because the regression harnesses drive it directly.
 bool read_slots(llama_context * ctx,
                 const tokenized & t,
                 const std::vector<int> & n_options,

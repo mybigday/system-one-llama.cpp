@@ -33,10 +33,6 @@
 
 using json = nlohmann::ordered_json;
 
-// How many option sequences a rank_head request will try to score in one decode. Raising it
-// costs a bigger micro-batch, i.e. memory; scoring 255 options at once is not worth that.
-static constexpr size_t SO_MAX_BATCHED_SEQS = 32;
-
 static void print_usage(int, char ** argv) {
     LOG("\nexample:\n");
     LOG("  %s -m model.gguf --state \"...\" --noul \"ok:Is the order complete?\"\n", argv[0]);
@@ -180,65 +176,6 @@ static bool collect_questions(const common_params & params,
     return true;
 }
 
-// rank_head scores one sequence per option through the model's classification head. They are
-// independent, so they go into as few decodes as the context allows rather than one each.
-// Two limits set the chunk size: a sequence needs its own seq_id, and a bidirectional model
-// cannot have a sequence split across ubatches -- so a whole chunk has to fit in one ubatch.
-static bool run_ranked(llama_context * ctx, const system_one::plan & p,
-                       std::vector<float> & scores, std::string & err) {
-    const uint32_t n_ubatch  = llama_n_ubatch(ctx);
-    const uint32_t n_seq_max = llama_n_seq_max(ctx);
-
-    scores.assign(p.sequences.size(), 0.0f);
-
-    for (size_t i = 0; i < p.sequences.size(); ) {
-        size_t n_seq = 0;
-        size_t n_tok = 0;
-        while (i + n_seq < p.sequences.size() && n_seq < n_seq_max) {
-            const size_t len = p.sequences[i + n_seq].tok.ids.size();
-            if (len > n_ubatch) {
-                err = "one option sequence is " + std::to_string(len) +
-                      " tokens, more than the micro-batch (" + std::to_string(n_ubatch) +
-                      ") -- raise -ub";
-                return false;
-            }
-            if (n_tok + len > n_ubatch) {
-                break;
-            }
-            n_tok += len;
-            n_seq++;
-        }
-
-        llama_memory_clear(llama_get_memory(ctx), true);
-
-        llama_batch batch = llama_batch_init((int32_t) n_tok, 0, (int32_t) n_seq);
-        for (size_t k = 0; k < n_seq; k++) {
-            const auto & ids = p.sequences[i + k].tok.ids;
-            for (size_t j = 0; j < ids.size(); j++) {
-                common_batch_add(batch, ids[j], (llama_pos) j, {(llama_seq_id) k}, true);
-            }
-        }
-        const int rc = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) {
-            err = "llama_decode failed on the batch starting at sequence " + std::to_string(i);
-            return false;
-        }
-
-        for (size_t k = 0; k < n_seq; k++) {
-            const float * out = llama_get_embeddings_seq(ctx, (llama_seq_id) k);
-            if (out == nullptr) {
-                err = "the model returned no pooled score -- is it a classification head?";
-                return false;
-            }
-            scores[i + k] = out[0];
-        }
-
-        i += n_seq;
-    }
-    return true;
-}
-
 int main(int argc, char ** argv) {
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SYSTEM_ONE, print_usage)) {
@@ -274,11 +211,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (cfg.ranked()) {
-        params.embedding    = true;
-        params.pooling_type = LLAMA_POOLING_TYPE_RANK;
-    }
-
     std::string state = params.so_state;
     if (!params.so_state_file.empty() && !read_file(params.so_state_file, state)) {
         LOG_ERR("%s: cannot read state file %s\n", __func__, params.so_state_file.c_str());
@@ -306,11 +238,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (plan.sequences.size() > 1) {
-        const size_t n_seq = std::min<size_t>(plan.sequences.size(), SO_MAX_BATCHED_SEQS);
-        size_t n_tok = 0;
-        for (size_t i = 0; i < n_seq; i++) n_tok += plan.sequences[i].tok.ids.size();
-
+    size_t n_seq = 0;
+    size_t n_tok = 0;
+    system_one::plan_batch_hint(plan, n_seq, n_tok);
+    if (n_seq > 1) {
         params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) n_seq);
         params.n_ubatch   = std::max<int32_t>(params.n_ubatch,   (int32_t) n_tok);
         params.n_batch    = std::max<int32_t>(params.n_batch,    params.n_ubatch);
@@ -318,6 +249,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params cparams = common_context_params_to_llama(params);
+    system_one::apply_context_params(cfg, cparams);
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
         LOG_ERR("%s: failed to create the context\n", __func__);
@@ -326,15 +258,7 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<system_one::answer> answers;
-    bool ok = false;
-    if (plan.rank_pooling) {
-        std::vector<float> scores;
-        ok = run_ranked(ctx, plan, scores, err) &&
-             system_one::answers_from_scores(plan, scores, answers, err);
-    } else {
-        ok = system_one::read_slots(ctx, plan.sequences[0].tok, plan.n_options, plan.labels, answers, err);
-    }
-    if (!ok) {
+    if (!system_one::run_plan(ctx, plan, answers, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_free(ctx); llama_model_free(model);
         return 1;
