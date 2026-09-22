@@ -3594,6 +3594,24 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // Non-causal attention cannot be split across physical batches: every
+                    // token attends to every other, so a sequence has to be decoded whole.
+                    if (!llama_get_causal_attn(ctx_tgt)) {
+                        const int32_t n_remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        if (n_remaining > (int32_t) n_ubatch) {
+                            send_error(slot, string_format(
+                                "this model attends bidirectionally, so its prompt (%d tokens) has to fit in one "
+                                "physical batch; start the server with -ub %d or more",
+                                n_remaining, n_remaining), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                            slot.release();
+                            return;
+                        }
+                        if (batch.size() + n_remaining > (int32_t) n_ubatch) {
+                            // let this slot wait for a batch it fits in
+                            return;
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process

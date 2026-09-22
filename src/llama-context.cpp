@@ -3933,6 +3933,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+bool llama_get_causal_attn(const llama_context * ctx) {
+    return ctx->get_cparams().causal_attn;
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }

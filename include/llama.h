@@ -1063,6 +1063,10 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Whether this context attends causally. A non-causal context cannot split a sequence
+    // across physical batches, since every token attends to every other.
+    LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
