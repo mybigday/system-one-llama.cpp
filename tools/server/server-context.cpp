@@ -51,8 +51,15 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
 
-    // a System One request reads one output per question out of a single sequence, all in
-    // the same decode, so its ceiling is set by the user rather than by speculation
+    // A System One request reads one output per question out of a single sequence, so a
+    // budget of one would be an artificial limit. Raising the ceiling is free: the logits
+    // buffer is grown by llama_context::output_reserve() to what a batch actually asks for,
+    // and cparams.n_outputs_max is only the declared maximum (init reserves n_seq_max rows).
+    // A batch can never hold more outputs than tokens, so n_batch is the real ceiling.
+    result.per_seq = std::max<int32_t>(result.per_seq, params.n_batch);
+    result.total   = std::max<int32_t>(result.total,   result.per_seq);
+
+    // ... and an explicit request for more than that still wins
     if (params.n_outputs_max_per_seq > result.per_seq) {
         result.per_seq = params.n_outputs_max_per_seq;
         result.total   = std::max(result.total, result.per_seq * std::max(1, params.n_parallel));
@@ -5443,9 +5450,11 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // every question needs its own output slot in one decode; without headroom
-        // llama_decode would abort, so refuse with something actionable instead
-        const int max_per_seq = std::max(1, params.n_outputs_max_per_seq);
+        // every question needs its own output slot in the one decode. The server budgets
+        // n_batch of them, which no request can exceed anyway (a batch holds at most
+        // n_batch tokens, and every question costs several), but check rather than let
+        // llama_decode abort on a ceiling the caller cannot see.
+        const int max_per_seq = std::max({1, params.n_batch, params.n_outputs_max_per_seq});
         if ((int) questions.size() > max_per_seq) {
             res->error(format_error_response(
                 "this server accepts at most " + std::to_string(max_per_seq) +
