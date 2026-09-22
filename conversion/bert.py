@@ -608,6 +608,19 @@ class ModernBertModel(BertModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+
+        # ModernBertForSequenceClassification pools the sequence itself before the head,
+        # per config.classifier_pooling. Gated on cls_out_labels like the classifier labels
+        # in BertModel: classifier_pooling has a default ("cls") on every ModernBertConfig,
+        # so writing it unconditionally would overwrite the sentence-transformers pooling
+        # of a plain embedding model.
+        if self.cls_out_labels:
+            pooling = self.hparams.get("classifier_pooling", "cls")
+            if pooling not in ("cls", "mean"):
+                raise ValueError(f"unsupported ModernBert classifier_pooling: {pooling}")
+            self.gguf_writer.add_pooling_type(
+                gguf.PoolingType.CLS if pooling == "cls" else gguf.PoolingType.MEAN)
+
         self.gguf_writer.add_sliding_window(self.hparams["local_attention"])
         if (sliding_window_pattern := self.hparams.get("global_attn_every_n_layers")) is not None:
             self.gguf_writer.add_sliding_window_pattern(sliding_window_pattern)
