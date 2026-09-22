@@ -259,14 +259,14 @@ bool tokenize_segments(const llama_vocab * vocab,
 
 bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
                   std::vector<llama_token> & out) {
-    const int n_vocab = llama_vocab_n_tokens(vocab);
+    // Tokenize each label rather than matching vocab text: a label is read at the position
+    // where the template would have written it, so it has to be what the tokenizer produces
+    // there. This also makes leading spaces work -- a format whose answers are " A", " B"
+    // reads the tokens a BPE vocab spells "ĠA", "ĠB", which no text comparison would find.
     out.assign(labels.size(), -1);
-    for (llama_token id = 0; id < n_vocab; id++) {
-        const char * txt = llama_vocab_get_text(vocab, id);
-        if (!txt) continue;
-        for (size_t i = 0; i < labels.size(); i++) {
-            if (out[i] < 0 && labels[i] == txt) out[i] = id;
-        }
+    for (size_t i = 0; i < labels.size(); i++) {
+        const auto ids = encode(vocab, labels[i], false, false);
+        if (ids.size() == 1) out[i] = ids[0];
     }
     return std::find(out.begin(), out.end(), -1) == out.end();
 }
