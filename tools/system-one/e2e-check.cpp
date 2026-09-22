@@ -154,6 +154,7 @@ int main(int argc, char ** argv) {
     const bool gelu_exact = ggml_gelu_is_exact();
     printf("build: gelu=%s  kv=%s  flash_attn=%s  threads=%d\n",
            gelu_exact ? "exact-f32" : "fp16-table", kv_f32 ? "f32" : "f16", use_fa ? "on" : "off", nthreads);
+    printf("readout: %s (%s), attention from the model\n", cfg.readout.c_str(), cfg.slot_rule.c_str());
     printf("ids come from our own tokenizer (the golden's input_ids are not used)\n");
 
     double sum_dl = 0, max_dl = 0, sum_dp = 0, max_dp = 0;

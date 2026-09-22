@@ -160,6 +160,10 @@ struct server_task {
         std::vector<int32_t>     slots;
         std::vector<int32_t>     n_options;
         std::vector<llama_token> letters;
+
+        // a bidirectional readout cannot reuse a cached prefix: every position attends to
+        // every other, so a changed tail changes the representation of the head too
+        bool no_prefix_reuse = false;
     };
     system_one_spec system_one;
 

@@ -71,12 +71,21 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
     meta_float(model, "system_one.calibration_temperature", out.calibration_temperature);
     meta_bool (model, "system_one.calibration_folded",      out.calibration_folded);
 
-    if (out.slot_rule != "last_token_of_question_segment") {
-        err = "unsupported system_one.slot rule: " + out.slot_rule;
+    if (meta_str(model, "system_one.mask_token", s) && !s.empty()) out.mask_text = s;
+    {
+        int id = -1;
+        meta_int(model, "system_one.mask_token_id", id);
+        out.mask_token = (llama_token) id;
+    }
+
+    const bool letter = out.readout == "letter_slot"  && out.slot_rule == "last_token_of_question_segment";
+    const bool masked = out.readout == "masked_slot"  && out.slot_rule == "mask_token_per_question";
+    if (!letter && !masked) {
+        err = "unsupported System One readout/slot combination: " + out.readout + " / " + out.slot_rule;
         return false;
     }
-    if (out.readout != "letter_slot") {
-        err = "unsupported system_one.readout: " + out.readout;
+    if (masked && out.mask_token < 0) {
+        err = "masked_slot needs system_one.mask_token_id";
         return false;
     }
     return true;
@@ -142,6 +151,7 @@ bool render_segments(const so_config & cfg,
             {"state",     state},
             {"questions", questions},
             {"sep",       cfg.segment_separator},
+            {"mask",      cfg.mask_text},     // empty unless the format places a mask token
         };
         jinja::global_from_json(ctx, inp, false);
 
@@ -181,17 +191,18 @@ bool render_segments(const so_config & cfg,
 
 // ---------------------------------------------------------------- tokenization
 
-static std::vector<llama_token> encode(const llama_vocab * vocab, const std::string & text, bool add_special) {
+static std::vector<llama_token> encode(const llama_vocab * vocab, const std::string & text,
+                                       bool add_special, bool parse_special = false) {
     if (text.empty()) return {};
-    int n = -llama_tokenize(vocab, text.data(), (int32_t) text.size(), nullptr, 0, add_special, false);
+    int n = -llama_tokenize(vocab, text.data(), (int32_t) text.size(), nullptr, 0, add_special, parse_special);
     std::vector<llama_token> out(n);
-    n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), out.data(), n, add_special, false);
+    n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), out.data(), n, add_special, parse_special);
     out.resize(std::max(0, n));
     return out;
 }
 
 std::vector<llama_token> tokenize_whole(const llama_vocab * vocab, const std::string & text, bool add_special) {
-    return encode(vocab, text, add_special);
+    return encode(vocab, text, add_special, true);
 }
 
 std::string truncate_state(const llama_vocab * vocab, const so_config & cfg, const std::string & state) {
@@ -233,16 +244,40 @@ bool tokenize_segments(const llama_vocab * vocab,
     out.slots.clear();
     if (cfg.add_bos) out.ids.push_back(llama_vocab_bos(vocab));
 
-    // the question blocks are the trailing segments; each one's last token is its slot
+    // the mask token is written into the template as text, so it has to be parsed back into
+    // its id; HF's tokenizers split on added tokens regardless of add_special_tokens, so this
+    // matches the reference. The letter-slot path keeps parse_special off, as validated.
+    const bool masked = cfg.slot_rule == "mask_token_per_question";
+
+    // the question blocks are the trailing segments
     const size_t first_question = segments.size() - n_questions;
     for (size_t i = 0; i < segments.size(); i++) {
-        const auto ids = encode(vocab, segments[i], false);
+        const auto ids = encode(vocab, segments[i], false, masked);
         if (ids.empty()) {
             err = "segment " + std::to_string(i) + " tokenized to nothing";
             return false;
         }
+        const size_t base = out.ids.size();
         out.ids.insert(out.ids.end(), ids.begin(), ids.end());
-        if (i >= first_question) out.slots.push_back((int) out.ids.size() - 1);
+
+        if (i < first_question) continue;
+
+        if (!masked) {
+            out.slots.push_back((int) out.ids.size() - 1);
+            continue;
+        }
+
+        // the answer is read at the mask token itself; take the last one in the segment
+        int slot = -1;
+        for (size_t j = ids.size(); j-- > 0; ) {
+            if (ids[j] == cfg.mask_token) { slot = (int) (base + j); break; }
+        }
+        if (slot < 0) {
+            err = "question segment " + std::to_string(i - first_question) +
+                  " has no mask token (" + std::to_string(cfg.mask_token) + ") after tokenization";
+            return false;
+        }
+        out.slots.push_back(slot);
     }
     return true;
 }

@@ -229,6 +229,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Qwen2_5OmniModel": "qwenvl",
     "Qwen2_5_VLForConditionalGeneration": "qwenvl",
     "Qwen3ASRForConditionalGeneration": "qwen3vl",
+    "A2DQwen3LMHeadModel": "qwen",   # masked-diffusion finetunes; Qwen3 tensors
     "Qwen3ForCausalLM": "qwen",
     "Qwen3Model": "qwen",
     "Qwen3MoeForCausalLM": "qwen",

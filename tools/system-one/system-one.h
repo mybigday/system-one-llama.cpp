@@ -40,8 +40,15 @@ struct question {
 struct so_config {
     std::string template_src;                                   // system_one.template (required)
     std::string segment_separator = "\x1e";
+
+    // where the answer sits in a question's segment, and what is read there:
+    //   last_token_of_question_segment + letter_slot  the next-token distribution after "("
+    //   mask_token_per_question        + masked_slot  the distribution at a mask token,
+    //                                                 which needs bidirectional attention
     std::string slot_rule         = "last_token_of_question_segment";
     std::string readout           = "letter_slot";
+    llama_token mask_token        = -1;     // system_one.mask_token_id
+    std::string mask_text;                  // system_one.mask_token, as the template writes it
     std::string letters           = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     std::vector<std::string> noul_options = {"no", "yes"};   // P(true) is the last one
@@ -65,7 +72,8 @@ struct so_config {
 };
 
 // Render the template, then split on the separator. The last `n_questions` segments are
-// the question blocks, whose final token is the answer slot.
+// the question blocks. `mask` is exposed to the template so a masked-slot format can place
+// its mask token, and the answer slot is then that token rather than the segment's end.
 bool render_segments(const so_config & cfg,
                      const std::string & state,
                      const std::vector<question> & qs,

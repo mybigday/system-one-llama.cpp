@@ -3457,7 +3457,9 @@ private:
                         // growing transcript still reuses everything up to where it changed.
                         if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.task->system_one.slots.empty()) {
                             const auto & so_slots = slot.task->system_one.slots;
-                            const int32_t first_answer = *std::min_element(so_slots.begin(), so_slots.end());
+                            const int32_t first_answer = slot.task->system_one.no_prefix_reuse
+                                ? 0
+                                : *std::min_element(so_slots.begin(), so_slots.end());
                             if (n_past > first_answer) {
                                 SLT_DBG(slot, "capping prompt reuse at the first answer slot (n_past = %d -> %d)\n",
                                         n_past, first_answer);
@@ -5491,6 +5493,8 @@ void server_routes::init_routes() {
             task.tokens = server_tokens(tok.ids, false);
             task.system_one.slots   = tok.slots;
             task.system_one.letters = letter_ids;
+            // bidirectional readouts read from inside the canvas; no prefix is reusable
+            task.system_one.no_prefix_reuse = cfg.readout != "letter_slot";
             for (const auto & q : questions) {
                 task.system_one.n_options.push_back((int32_t) q.options.size());
             }

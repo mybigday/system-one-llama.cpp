@@ -131,7 +131,8 @@ class ModelBase:
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 fuse_qkv: bool = False):
+                 fuse_qkv: bool = False,
+                 system_one: dict[str, Any] | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -141,6 +142,7 @@ class ModelBase:
             raise ImportError(_mistral_import_error_msg)
 
         self.dir_model = dir_model
+        self.system_one_override = system_one or {}
         self.ftype = ftype
         self.fname_out = fname_out
         self.is_big_endian = is_big_endian
@@ -1158,43 +1160,27 @@ class ModelBase:
         self.set_system_one_metadata()
 
     def set_system_one_metadata(self):
-        # System One checkpoints ship a `system_one.json` sidecar describing the prompt
-        # format and the readout of that specific export. It is written by the export
-        # step, so this side only copies it into `system_one.*` GGUF kv. No sidecar, no
-        # keys -- a plain HF model converts exactly as before.
+        # Three equivalent ways in, because `system_one.json` is our own convention and nobody
+        # else's checkpoint ships one: the sidecar, --system-one KEY=VALUE on this script, or
+        # gguf_set_system_one.py on an existing file. Later sources win. Without any of them
+        # nothing is written and an ordinary model converts exactly as before.
+        values: dict[str, Any] = {}
+
         sidecar = self.dir_model / "system_one.json"
-        if not sidecar.is_file():
+        if sidecar.is_file():
+            with open(sidecar, encoding="utf-8") as f:
+                logger.info(f"Reading System One metadata from {sidecar.name}")
+                values.update(dict(gguf.system_one.flatten("", json.load(f))))
+
+        # values typed on the command line arrive as text, so they need their escapes decoded
+        for key, val in self.system_one_override.items():
+            values[key] = gguf.system_one.coerce(key, val, from_text=True)
+
+        if not values:
             return
 
-        with open(sidecar, encoding="utf-8") as f:
-            raw = json.load(f)
-
-        def flatten(prefix: str, value: Any) -> Iterator[tuple[str, Any]]:
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    yield from flatten(f"{prefix}.{k}" if prefix else str(k), v)
-            else:
-                yield prefix, value
-
-        logger.info(f"Set System One metadata from {sidecar.name}")
-        for key, val in flatten("", raw):
-            if not key.startswith("system_one."):
-                logger.warning(f"system_one: skipping key outside the namespace: {key}")
-                continue
-            if isinstance(val, bool):
-                self.gguf_writer.add_bool(key, val)
-            elif isinstance(val, int):
-                self.gguf_writer.add_uint32(key, val)
-            elif isinstance(val, float):
-                self.gguf_writer.add_float32(key, val)
-            elif isinstance(val, str):
-                self.gguf_writer.add_string(key, val)
-            elif isinstance(val, list) and all(isinstance(v, str) for v in val):
-                self.gguf_writer.add_array(key, val)
-            else:
-                logger.warning(f"system_one: unsupported value type for {key}: {type(val).__name__}")
-                continue
-            logger.debug(f"system_one: {key} = {val!r}")
+        n = gguf.system_one.write(self.gguf_writer, values)
+        logger.info(f"Set System One metadata ({n} key(s))")
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
