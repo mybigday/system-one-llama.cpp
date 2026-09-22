@@ -1155,6 +1155,47 @@ class ModelBase:
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
+        self.set_system_one_metadata()
+
+    def set_system_one_metadata(self):
+        # System One checkpoints ship a `system_one.json` sidecar describing the prompt
+        # format and the readout of that specific export. It is written by the export
+        # step, so this side only copies it into `system_one.*` GGUF kv. No sidecar, no
+        # keys -- a plain HF model converts exactly as before.
+        sidecar = self.dir_model / "system_one.json"
+        if not sidecar.is_file():
+            return
+
+        with open(sidecar, encoding="utf-8") as f:
+            raw = json.load(f)
+
+        def flatten(prefix: str, value: Any) -> Iterator[tuple[str, Any]]:
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    yield from flatten(f"{prefix}.{k}" if prefix else str(k), v)
+            else:
+                yield prefix, value
+
+        logger.info(f"Set System One metadata from {sidecar.name}")
+        for key, val in flatten("", raw):
+            if not key.startswith("system_one."):
+                logger.warning(f"system_one: skipping key outside the namespace: {key}")
+                continue
+            if isinstance(val, bool):
+                self.gguf_writer.add_bool(key, val)
+            elif isinstance(val, int):
+                self.gguf_writer.add_uint32(key, val)
+            elif isinstance(val, float):
+                self.gguf_writer.add_float32(key, val)
+            elif isinstance(val, str):
+                self.gguf_writer.add_string(key, val)
+            elif isinstance(val, list) and all(isinstance(v, str) for v in val):
+                self.gguf_writer.add_array(key, val)
+            else:
+                logger.warning(f"system_one: unsupported value type for {key}: {type(val).__name__}")
+                continue
+            logger.debug(f"system_one: {key} = {val!r}")
+
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
 
@@ -1513,7 +1554,15 @@ class TextModel(ModelBase):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
-        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
+
+        # Tokens at or beyond vocab_size have no embedding row, so the model can neither
+        # emit nor embed them, and the loop below already ignores them. Some checkpoints
+        # carry one anyway -- e.g. the multimodal <image_soft_token> at id 262144 riding
+        # along in a text-only gemma-3-270m tokenizer -- so warn and drop, don't refuse.
+        oversize = {tok: i for tok, i in tokenizer.vocab.items() if i >= vocab_size}  # ty: ignore[unresolved-attribute]
+        if oversize:
+            logger.warning(f"ignoring {len(oversize)} token(s) at or beyond vocab_size {vocab_size}: "
+                           f"{sorted(oversize.items(), key=lambda kv: kv[1])[:8]}")
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
@@ -1913,7 +1962,15 @@ class TextModel(ModelBase):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
-        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
+
+        # Tokens at or beyond vocab_size have no embedding row, so the model can neither
+        # emit nor embed them, and the loop below already ignores them. Some checkpoints
+        # carry one anyway -- e.g. the multimodal <image_soft_token> at id 262144 riding
+        # along in a text-only gemma-3-270m tokenizer -- so warn and drop, don't refuse.
+        oversize = {tok: i for tok, i in tokenizer.vocab.items() if i >= vocab_size}  # ty: ignore[unresolved-attribute]
+        if oversize:
+            logger.warning(f"ignoring {len(oversize)} token(s) at or beyond vocab_size {vocab_size}: "
+                           f"{sorted(oversize.items(), key=lambda kv: kv[1])[:8]}")
 
         reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
         # k-mers can share text with a base-vocab BPE token (e.g. CCCCCC) and get
