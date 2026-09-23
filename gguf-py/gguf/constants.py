@@ -313,6 +313,12 @@ class Keys:
     class ShortConv:
         L_CACHE = "{arch}.shortconv.l_cache"
 
+    class SystemOne:
+        # Typed-decision models (tools/system-one). Both optional: the readout is derived from
+        # the model's own capabilities, and the prompt is the named chat template `system_one`.
+        LABELS             = "system_one.labels"
+        SEGMENT_SEPARATOR  = "system_one.segment_separator"
+
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
         PRE                  = "tokenizer.ggml.pre"

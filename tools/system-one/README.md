@@ -14,7 +14,16 @@ answers, and `llama-system-one`, a CLI over it.
 |---|---|---|
 | `noul` | P(true) for an assertion | a threshold: act at > 0.8, ask again below 0.4 |
 | `choice` | a distribution over declared options | routing, classification, intent |
-| `score` | a distribution over ordered levels, plus its expectation | severity, satisfaction, priority |
+| `score` | a distribution over ordered levels, plus its index-weighted mean | severity, satisfaction, priority |
+
+A `score` answer carries both because neither is enough on its own. The number is
+`Σ i·pᵢ` over the levels' **0-based indices**, so it runs from `0` to `n_levels − 1` -- with
+the four levels below, `0` is `routine` and `3` is `critical`, and the 1.87 in the run is
+"between soon and urgent, nearer urgent". That is the thing to threshold, but it cannot tell a
+confident level from a flat spread: 1.5 is both "certainly halfway" and "no idea". The
+distribution says which, and it is what makes the mean meaningful at all -- the levels have to
+be evenly spaced for an average of their indices to mean anything, which is an assumption the
+caller makes when it chooses them.
 
 Every answer also carries `confidence = 1 − H(p)/ln K` and its raw logits, because calibration
 is the product: a consumer that only takes the argmax could have used anything.
@@ -63,7 +72,7 @@ actually serve, before trusting its numbers.
 | `--state TEXT` / `--state-file FNAME` | the context the questions are asked about |
 | `--noul KEY:INSTRUCTIONS` | a true/false question; repeatable |
 | `--choice KEY:INSTRUCTIONS:opt[=desc][,...]` | pick one declared option; repeatable |
-| `--score KEY:INSTRUCTIONS:level[,...]` | ordered levels, and the expectation over them |
+| `--score KEY:INSTRUCTIONS:level[,...]` | ordered levels, and the mean of their indices |
 | `--system-one-request FNAME` | the whole request as JSON, instead of the flags |
 | `--system-one-template-file FNAME` | override the checkpoint's System One template |
 | `--labels A,B,C` | override the labels an answer is read at (default A-Za-z) |
@@ -136,44 +145,3 @@ has fitted a T on its own distribution. The raw logits are in every answer, so a
 elaborate is the caller's to compute.
 
 It is not `--temp`, the sampling temperature, which means nothing here: nothing is sampled.
-
-## Using the library
-
-`system-one.h` builds the input and reads the output. It never calls `llama_decode` -- the
-same split `common/chat.h` has, where the decode loop belongs to whoever owns the batching.
-
-```cpp
-system_one_params cfg  = system_one_params_from_model(model);
-system_one_plan   plan = system_one_build_plan(cfg, vocab, state, questions);
-system_one_tokenize_plan(vocab, cfg, plan);           // stage two, for an all-text state
-
-// ... you decode plan.sequences, asking for logits at each sequence's tok.slots ...
-
-const std::vector<system_one_answer> answers = system_one_answers_from_logits(plan, rows);
-```
-
-Planning and tokenizing are separate stages because a caller may have to encode part of the
-input itself: a state carrying images or audio is tokenized by whoever holds the mtmd context,
-and `system_one_resolve_question_slots()` then places the question blocks after however many
-positions that state occupied.
-
-The plan is where every decision that depends on the readout is made -- how many sequences to
-run, which tokens carry the answer, where it sits, and how far a prefix may be reused. A
-caller runs sequences and hands the numbers back:
-
-| | |
-|---|---|
-| `system_one_answers_from_logits(plan, rows)` | slot readouts: one row of vocab logits per answer slot |
-| `system_one_answers_from_scores(plan, scores)` | `rank_head`: one score per planned sequence |
-| `system_one_answer_from_logits(row, labels, n)` | the primitive, for a caller that must read one row while it is briefly valid |
-| `system_one_required_context(cfg)` | what the readout needs of the context (embeddings, pooling) |
-
-Errors are exceptions, as in `common/chat.h`: `std::invalid_argument` when the request or the
-template as stated cannot be answered, `std::runtime_error` when the checkpoint cannot, or when
-the numbers handed back do not fit the plan. `llama-server` wraps every route in `ex_wrapper`,
-which turns the first into a 400 and the second into a 500 with the message attached, so a
-route needs no error handling of its own.
-
-`llama-server` exposes the same thing over HTTP as `POST /v1/systemone`; see
-[the server's API documentation](../server/README.md#post-v1systemone-typed-decisions-system-one-models).
-Both front ends are adapters over this library, which is why they cannot drift apart.

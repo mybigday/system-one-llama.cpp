@@ -142,7 +142,7 @@ class ModelBase:
             raise ImportError(_mistral_import_error_msg)
 
         self.dir_model = dir_model
-        self.system_one_override = system_one or {}
+        self.system_one = system_one or {}
         self.ftype = ftype
         self.fname_out = fname_out
         self.is_big_endian = is_big_endian
@@ -1160,27 +1160,21 @@ class ModelBase:
         self.set_system_one_metadata()
 
     def set_system_one_metadata(self):
-        # Three equivalent ways in, because `system_one.json` is our own convention and nobody
-        # else's checkpoint ships one: the sidecar, --system-one KEY=VALUE on this script, or
-        # gguf_set_system_one.py on an existing file. Later sources win. Without any of them
-        # nothing is written and an ordinary model converts exactly as before.
-        values: dict[str, Any] = {}
-
-        sidecar = self.dir_model / "system_one.json"
-        if sidecar.is_file():
-            with open(sidecar, encoding="utf-8") as f:
-                logger.info(f"Reading System One metadata from {sidecar.name}")
-                values.update(dict(gguf.system_one.flatten("", json.load(f))))
-
-        # values typed on the command line arrive as text, so they need their escapes decoded
-        for key, val in self.system_one_override.items():
-            values[key] = gguf.system_one.coerce(key, val, from_text=True)
-
-        if not values:
+        # Nothing is written unless asked for, so an ordinary model converts exactly as before.
+        # The template is a named chat template rather than a key of its own, and the other two
+        # are optional overrides of their defaults -- where the answer is read from is derived
+        # from the model's capabilities, not declared. See tools/system-one/README.md.
+        if not self.system_one:
             return
 
-        n = gguf.system_one.write(self.gguf_writer, values)
-        logger.info(f"Set System One metadata ({n} key(s))")
+        if "template" in self.system_one:
+            self.gguf_writer.add_chat_template([{"name": "system_one", "template": self.system_one["template"]}])
+        if "labels" in self.system_one:
+            self.gguf_writer.add_system_one_labels(self.system_one["labels"])
+        if "segment_separator" in self.system_one:
+            self.gguf_writer.add_system_one_segment_separator(self.system_one["segment_separator"])
+
+        logger.info(f"Set System One metadata ({', '.join(sorted(self.system_one))})")
 
     def write_vocab(self):
         raise NotImplementedError("write_vocab() must be implemented in subclasses")

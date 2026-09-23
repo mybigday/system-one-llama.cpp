@@ -173,17 +173,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--system-one", action="append", metavar="KEY=VALUE", default=[],
-        help="set a System One metadata key, e.g. --system-one system_one.readout=letter_slot. "
-             "Repeatable, and overrides a system_one.json sidecar. See docs/SYSTEM_ONE_GGUF_SPEC.md",
-    )
-    parser.add_argument(
         "--system-one-template", type=Path, metavar="FILE",
-        help="file holding the System One Jinja template (system_one.template)",
+        help="Jinja template making this a System One model, stored as the named chat template "
+             "`system_one`. See tools/system-one/README.md",
     )
     parser.add_argument(
-        "--system-one-json", type=Path, metavar="FILE",
-        help="System One sidecar to read instead of one sitting next to the model",
+        "--system-one-labels", type=str, metavar="A,B,C",
+        help="the labels a System One answer is read at, when the template does not write A-Za-z",
+    )
+    parser.add_argument(
+        "--system-one-segment-separator", type=str, metavar="SEP",
+        help="the marker the System One template puts at each tokenizer seam (default U+001E)",
     )
 
     args = parser.parse_args()
@@ -298,18 +298,14 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
-        system_one_override: dict[str, Any] = {}
-        if args.system_one_json:
-            with open(args.system_one_json, encoding="utf-8") as f:
-                for k, v in json.load(f).items():
-                    system_one_override[k] = v
-        for item in args.system_one:
-            if "=" not in item:
-                raise ValueError(f"--system-one expects KEY=VALUE, got {item!r}")
-            k, v = item.split("=", 1)
-            system_one_override[k.strip()] = v
+        system_one: dict[str, Any] = {}
         if args.system_one_template:
-            system_one_override["system_one.template"] = args.system_one_template.read_text(encoding="utf-8").rstrip("\n")
+            system_one["template"] = args.system_one_template.read_text(encoding="utf-8").rstrip("\n")
+        if args.system_one_labels:
+            system_one["labels"] = [x for x in args.system_one_labels.split(",") if x]
+        if args.system_one_segment_separator:
+            # so a separator a shell cannot type can be written as \x1e
+            system_one["segment_separator"] = args.system_one_segment_separator.encode().decode("unicode_escape")
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
@@ -324,7 +320,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      fuse_qkv=args.fuse_qkv,
-                                     system_one=system_one_override,
+                                     system_one=system_one,
                                      )
 
         if args.vocab_only:
