@@ -3,9 +3,9 @@
 // A System One model does not write text. Give it a state and a set of typed questions and
 // it returns, in one forward pass, a distribution over each question's declared options:
 //
-//   llama-system-one -m model.gguf --state "I'd like two burgers, hold the drink" \
-//       --noul   "done:Has the customer finished ordering?" \
-//       --choice "item:What is the main item?:burger=a burger,fries=fries,drink=a drink" \
+//   llama-system-one -m model.gguf --state "I'd like two burgers, hold the drink"
+//       --noul   "done:Has the customer finished ordering?"
+//       --choice "item:What is the main item?:burger=a burger,fries=fries,drink=a drink"
 //       --score  "mood:How satisfied do they sound?:angry,unhappy,neutral,happy,delighted"
 //
 // The same request can be given as the JSON body the server's /v1/systemone route takes
@@ -258,22 +258,20 @@ static bool decode_slots(llama_context * ctx, const system_one_plan * p,
         return false;
     }
 
-    size_t n_labels = 0;
-    const llama_token * labels = system_one_plan_get_labels(p, &n_labels);
-
+    // Which labels to read and how many options each question declared are the plan's to
+    // know; this loop only says where each answer's logits are.
+    std::vector<const float *> rows(t.n_slots, nullptr);
     for (size_t qi = 0; qi < t.n_slots; qi++) {
-        const float * row = llama_get_logits_ith(ctx, t.slots[qi]);
-        if (row == nullptr) {
+        rows[qi] = llama_get_logits_ith(ctx, t.slots[qi]);
+        if (rows[qi] == nullptr) {
             err = "no logits at answer slot " + std::to_string(qi);
             return false;
         }
-        system_one_answer * a =
-            system_one_answer_init_from_logits(row, labels, n_labels, system_one_plan_get_n_options(p, qi));
-        if (a == nullptr) {
-            err = "could not read the answer at slot " + std::to_string(qi);
-            return false;
-        }
-        system_one_answers_add(out, a);
+    }
+
+    if (system_one_answers_from_logits(p, rows.data(), rows.size(), out) != 0) {
+        err = "could not read the answers at the slots (see the log)";
+        return false;
     }
     return true;
 }
@@ -379,9 +377,8 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan * p,
         i += n_seq;
     }
 
-    system_one::error_buffer eb;
-    if (system_one_answers_from_scores(p, scores.data(), scores.size(), out, eb.data(), eb.size()) != 0) {
-        err = eb.str();
+    if (system_one_answers_from_scores(p, scores.data(), scores.size(), out) != 0) {
+        err = "could not assemble the answers from the scores (see the log)";
         return false;
     }
     return true;
@@ -408,10 +405,9 @@ int main(int argc, char ** argv) {
     }
 
     std::string err;
-    system_one::error_buffer eb;
-    system_one::params_ptr cfg(system_one_params_init_from_model(model, eb.data(), eb.size()));
+    system_one::params_ptr cfg(system_one_params_init_from_model(model));
     if (!cfg) {
-        LOG_ERR("%s: %s\n", __func__, eb.str().c_str());
+        LOG_ERR("%s: this model has no System One template\n", __func__);
         llama_model_free(model);
         return 1;
     }
@@ -462,9 +458,9 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     system_one::plan_ptr plan(system_one_plan_init(cfg.get(), vocab, state.c_str(),
-                                                   qs.c_ptr(), qs.size(), eb.data(), eb.size()));
-    if (!plan || system_one_plan_tokenize(plan.get(), vocab, cfg.get(), eb.data(), eb.size()) != 0) {
-        LOG_ERR("%s: %s\n", __func__, eb.str().c_str());
+                                                   qs.c_ptr(), qs.size()));
+    if (!plan || system_one_plan_tokenize(plan.get(), vocab, cfg.get()) != 0) {
+        LOG_ERR("%s: could not build the prompt for this request\n", __func__);
         llama_model_free(model);
         return 1;
     }

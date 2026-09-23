@@ -37,10 +37,32 @@
  * `system_one.segment_separator` (U+001E); this side splits on it and tokenizes each piece on
  * its own.
  *
+ * Lifetimes, since this is a C API and nothing here is reference counted:
+ * - `_init*` returns memory you own and must pass to the matching `_free`. `_get_*` returns a
+ *   borrowed pointer you must NOT free; it stays valid as long as the object it came from is
+ *   alive and unmodified.
+ * - A `system_one_plan` owns its sequences and their tokens.
+ *   `system_one_plan_get_sequence()` stays valid across `system_one_plan_tokenize()`, which
+ *   fills the sequences in place and never adds or removes one.
+ * - What invalidates a borrowed pointer: `system_one_params_set_template()` and
+ *   `_set_labels()` invalidate the strings the matching getters returned;
+ *   `system_one_resolve_question_slots()` invalidates the arrays of the
+ *   `system_one_tokenized` it writes into; `system_one_answers_add()` invalidates every
+ *   pointer `system_one_answers_get()` returned earlier.
+ * - `system_one_answers_add()` takes ownership of the answer, including when it cannot store
+ *   it.
+ *
+ * Errors follow llama.cpp's convention: the detail is logged, and the call returns 0 / non-zero
+ * (or NULL from a constructor). What kind of failure it was is the caller's call site, not a
+ * value -- a route already knows whether it is answering "this model cannot do that" or "your
+ * request is malformed", which is the distinction its client needs.
+ *
  * For contributors:
  * - Keep the C API aligned with the libllama C API (as in llama.h)
  * - Anything that owns a container is opaque; plain value bags are PODs
- * - Every fallible call ends with (char * err, size_t err_len); err may be NULL
+ * - `_init` names a constructor you must free; `_get_` names a borrow. Never the other way
+ *   round: in a C API the name is the only place that contract is written down.
+ * - Every fallible call ends with (); err may be NULL
  */
 
 #ifdef LLAMA_SHARED
@@ -129,8 +151,7 @@ SYSTEM_ONE_API const char * system_one_readout_name(enum system_one_readout read
 SYSTEM_ONE_API system_one_params * system_one_params_init(void);
 
 // Reads the model's metadata. Returns NULL when the model carries no System One template.
-SYSTEM_ONE_API system_one_params * system_one_params_init_from_model(const struct llama_model * model,
-                                                                     char * err, size_t err_len);
+SYSTEM_ONE_API system_one_params * system_one_params_init_from_model(const struct llama_model * model);
 SYSTEM_ONE_API void system_one_params_free(system_one_params * params);
 
 // Derived from the model's capabilities, not required in the GGUF: a classification head means
@@ -180,15 +201,13 @@ SYSTEM_ONE_API system_one_plan * system_one_plan_init(const system_one_params * 
                                                       const struct llama_vocab * vocab,
                                                       const char * state,
                                                       const struct system_one_question * questions,
-                                                      size_t n_questions,
-                                                      char * err, size_t err_len);
+                                                      size_t n_questions);
 SYSTEM_ONE_API void system_one_plan_free(system_one_plan * plan);
 
 // Returns 0 on success.
 SYSTEM_ONE_API int32_t system_one_plan_tokenize(system_one_plan * plan,
                                                 const struct llama_vocab * vocab,
-                                                const system_one_params * params,
-                                                char * err, size_t err_len);
+                                                const system_one_params * params);
 
 SYSTEM_ONE_API size_t  system_one_plan_get_n_sequences(const system_one_plan * plan);
 SYSTEM_ONE_API size_t  system_one_plan_get_n_questions(const system_one_plan * plan);
@@ -256,15 +275,20 @@ SYSTEM_ONE_API int32_t system_one_resolve_question_slots(const struct llama_voca
                                                          const char * const * question_segments,
                                                          size_t n_segments,
                                                          size_t prefix_positions,
-                                                         system_one_tokenized * out,
-                                                         char * err, size_t err_len);
+                                                         system_one_tokenized * out);
 
 //
 // system_one_answer -- one question's distribution, and what follows from it
 //
 
-// Gather the first n_options label tokens out of one row of vocab logits, softmax over just
-// those, argmax, and the entropy-normalised confidence. Returns NULL on bad arguments.
+// One answer from one row of vocab logits: gather the first n_options label tokens, softmax
+// over just those, argmax, and the entropy-normalised confidence. Returns NULL on bad
+// arguments.
+//
+// This is the primitive. A caller that has every row in hand wants
+// system_one_answers_from_logits() instead, which reads the labels and the option counts off
+// the plan; this one is for a caller that must read a row while it is briefly valid and cannot
+// wait for the rest -- a server collecting answers as sub-batches come back.
 SYSTEM_ONE_API system_one_answer * system_one_answer_init_from_logits(const float * row,
                                                                       const llama_token * labels,
                                                                       size_t n_labels,
@@ -286,7 +310,7 @@ SYSTEM_ONE_API float system_one_answer_get_score_expectation(const system_one_an
 // Rescale by a temperature and recompute everything that follows from it. The model ships with
 // its own T already folded into its weights, so this is for a caller recalibrating on a
 // distribution of its own; T = 1 is the common case and costs nothing, which is why it is
-// checked rather than applied. One T per request, not per question.
+// checked rather than applied.
 SYSTEM_ONE_API void system_one_answer_apply_temperature(system_one_answer * answer, float t);
 
 //
@@ -303,20 +327,34 @@ SYSTEM_ONE_API const system_one_answer * system_one_answers_get (const system_on
 // counterpart, where the library assembles the list from one score per sequence.
 SYSTEM_ONE_API void system_one_answers_add(system_one_answers * answers, system_one_answer * answer);
 
-// Assemble a request's answers from one score per planned sequence, in plan order.
-// Returns 0 on success.
+// A temperature is one value per request, so this is the form a request uses; the per-answer
+// call above is the primitive it is built on. T = 1 costs nothing either way.
+SYSTEM_ONE_API void system_one_answers_apply_temperature(system_one_answers * answers, float t);
+
+// A whole request's answers in one call, which is where the two readouts differ and the only
+// place a caller should have to care which it has:
+//
+//   _from_logits  a slot readout: one row of vocab logits per answer slot, in question order.
+//                 The plan says which label tokens to read and how many options each question
+//                 declared, so the caller never handles either.
+//   _from_scores  a rank_head readout: one score per planned sequence, in plan order. The plan
+//                 says which sequence scored which question's which option.
+//
+// Both return 0 on success and append to `out` in question order.
+SYSTEM_ONE_API int32_t system_one_answers_from_logits(const system_one_plan * plan,
+                                                      const float * const * rows, size_t n_rows,
+                                                      system_one_answers * out);
+
 SYSTEM_ONE_API int32_t system_one_answers_from_scores(const system_one_plan * plan,
                                                       const float * scores, size_t n_scores,
-                                                      system_one_answers * out,
-                                                      char * err, size_t err_len);
+                                                      system_one_answers * out);
 
 // Token ids of the label pieces, in label order, into a caller array of n_labels entries.
 // Every label must be a single token, since the answer is read as one position's distribution
 // over them. Returns 0 on success; on failure `err` names the offending label.
 SYSTEM_ONE_API int32_t system_one_label_tokens(const struct llama_vocab * vocab,
                                                const char * const * labels, size_t n_labels,
-                                               llama_token * out,
-                                               char * err, size_t err_len);
+                                               llama_token * out);
 
 #ifdef __cplusplus
 } // extern "C"
@@ -354,14 +392,6 @@ struct answers_deleter {
     void operator()(system_one_answers * val) { system_one_answers_free(val); }
 };
 using answers_ptr = std::unique_ptr<system_one_answers, answers_deleter>;
-
-// Error text, for the calls that take (char * err, size_t err_len).
-struct error_buffer {
-    char buf[512] = {0};
-    char * data() { return buf; }
-    size_t size() const { return sizeof(buf); }
-    std::string str() const { return std::string(buf); }
-};
 
 // A question stated in C++ terms. The C struct borrows pointers, so the strings have to
 // outlive the call that takes them; question_list owns them and hands out the array.

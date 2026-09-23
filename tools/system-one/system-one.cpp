@@ -3,6 +3,7 @@
 #include "chat.h"                 // pulls in the jinja engine the chat templates use
 #include "common.h"               // common_tokenize, string_split
 #include "json.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -74,16 +75,11 @@ struct system_one_answers {
     std::vector<system_one_answer> entries;
 };
 
-// Every fallible C entry point takes a caller buffer instead of returning a code alone: these
-// messages name the offending question or label, and the server route puts them straight into
-// its JSON error body.
-static void set_err(char * err, size_t err_len, const std::string & msg) {
-    if (err == nullptr || err_len == 0) {
-        return;
-    }
-    const size_t n = msg.size() < err_len - 1 ? msg.size() : err_len - 1;
-    memcpy(err, msg.data(), n);
-    err[n] = '\0';
+// The detail goes to the log and the call returns a code, which is what every other llama.cpp
+// entry point does. These messages name the offending question or label, so they are worth
+// printing in full -- but what *kind* of failure it was is the caller's call site, not a value.
+static void log_err(const std::string & msg) {
+    LOG_ERR("system-one: %s\n", msg.c_str());
 }
 
 
@@ -689,9 +685,9 @@ system_one_params * system_one_params_init(void) {
     return out.release();
 }
 
-system_one_params * system_one_params_init_from_model(const llama_model * model, char * err, size_t err_len) {
+system_one_params * system_one_params_init_from_model(const llama_model * model) {
     if (model == nullptr) {
-        set_err(err, err_len, "no model");
+        log_err("no model");
         return nullptr;
     }
 
@@ -699,7 +695,7 @@ system_one_params * system_one_params_init_from_model(const llama_model * model,
 
     std::string msg;
     if (!params_from_model(model, *out, msg)) {
-        set_err(err, err_len, msg);
+        log_err(msg);
         return nullptr;
     }
     return out.release();
@@ -785,14 +781,13 @@ system_one_plan * system_one_plan_init(const system_one_params * params,
                                        const llama_vocab * vocab,
                                        const char * state,
                                        const struct system_one_question * questions,
-                                       size_t n_questions,
-                                       char * err, size_t err_len) {
+                                       size_t n_questions) {
     if (params == nullptr || vocab == nullptr) {
-        set_err(err, err_len, "no params or no vocab");
+        log_err("no params or no vocab");
         return nullptr;
     }
     if (questions == nullptr && n_questions > 0) {
-        set_err(err, err_len, "n_questions is non-zero but no questions were given");
+        log_err("n_questions is non-zero but no questions were given");
         return nullptr;
     }
 
@@ -800,7 +795,7 @@ system_one_plan * system_one_plan_init(const system_one_params * params,
 
     std::string msg;
     if (!build_plan(*params, vocab, state ? state : "", questions_from_c(questions, n_questions), *out, msg)) {
-        set_err(err, err_len, msg);
+        log_err(msg);
         return nullptr;
     }
     return out.release();
@@ -812,16 +807,15 @@ void system_one_plan_free(system_one_plan * plan) {
 
 int32_t system_one_plan_tokenize(system_one_plan * plan,
                                  const llama_vocab * vocab,
-                                 const system_one_params * params,
-                                 char * err, size_t err_len) {
+                                 const system_one_params * params) {
     if (plan == nullptr || vocab == nullptr || params == nullptr) {
-        set_err(err, err_len, "no plan, no vocab or no params");
+        log_err("no plan, no vocab or no params");
         return 1;
     }
 
     std::string msg;
     if (!tokenize_plan(vocab, *params, *plan, msg)) {
-        set_err(err, err_len, msg);
+        log_err(msg);
         return 1;
     }
     return 0;
@@ -919,10 +913,9 @@ int32_t system_one_resolve_question_slots(const llama_vocab * vocab,
                                           const char * const * question_segments,
                                           size_t n_segments,
                                           size_t prefix_positions,
-                                          system_one_tokenized * out,
-                                          char * err, size_t err_len) {
+                                          system_one_tokenized * out) {
     if (vocab == nullptr || params == nullptr || out == nullptr) {
-        set_err(err, err_len, "no vocab, no params or no output");
+        log_err("no vocab, no params or no output");
         return 1;
     }
 
@@ -937,7 +930,7 @@ int32_t system_one_resolve_question_slots(const llama_vocab * vocab,
 
     std::string msg;
     if (!resolve_question_slots(vocab, *params, segments, prefix_positions, out->ids, out->slots, msg)) {
-        set_err(err, err_len, msg);
+        log_err(msg);
         return 1;
     }
     return 0;
@@ -1016,19 +1009,61 @@ const system_one_answer * system_one_answers_get(const system_one_answers * answ
 }
 
 void system_one_answers_add(system_one_answers * answers, system_one_answer * answer) {
-    if (answers == nullptr || answer == nullptr) {
+    if (answer == nullptr) {
         return;
     }
-    answers->entries.push_back(std::move(*answer));
+    // ownership is taken either way: a caller that has handed the answer over must not be left
+    // holding a pointer it no longer believes it owns
+    if (answers != nullptr) {
+        answers->entries.push_back(std::move(*answer));
+    }
     delete answer;
+}
+
+void system_one_answers_apply_temperature(system_one_answers * answers, float t) {
+    if (answers == nullptr) {
+        return;
+    }
+    for (auto & a : answers->entries) {
+        apply_temperature(a, t);
+    }
+}
+
+int32_t system_one_answers_from_logits(const system_one_plan * plan,
+                                       const float * const * rows, size_t n_rows,
+                                       system_one_answers * out) {
+    if (plan == nullptr || out == nullptr || (rows == nullptr && n_rows > 0)) {
+        log_err("no plan, no logit rows or no output");
+        return 1;
+    }
+    if (plan->rank_pooling) {
+        log_err("this readout is scored by the model's head, not read at a slot -- "
+                              "use system_one_answers_from_scores()");
+        return 1;
+    }
+    if (n_rows != plan->n_options.size()) {
+        log_err("got " + std::to_string(n_rows) + " logit rows for " +
+                              std::to_string(plan->n_options.size()) + " questions");
+        return 1;
+    }
+
+    out->entries.clear();
+    out->entries.reserve(n_rows);
+    for (size_t qi = 0; qi < n_rows; qi++) {
+        if (rows[qi] == nullptr) {
+            log_err("no logits for question " + std::to_string(qi));
+            return 1;
+        }
+        out->entries.push_back(answer_from_logits(rows[qi], plan->labels, plan->n_options[qi]));
+    }
+    return 0;
 }
 
 int32_t system_one_answers_from_scores(const system_one_plan * plan,
                                        const float * scores, size_t n_scores,
-                                       system_one_answers * out,
-                                       char * err, size_t err_len) {
+                                       system_one_answers * out) {
     if (plan == nullptr || out == nullptr || (scores == nullptr && n_scores > 0)) {
-        set_err(err, err_len, "no plan, no scores or no output");
+        log_err("no plan, no scores or no output");
         return 1;
     }
 
@@ -1036,7 +1071,7 @@ int32_t system_one_answers_from_scores(const system_one_plan * plan,
 
     std::string msg;
     if (!answers_from_scores(*plan, std::vector<float>(scores, scores + n_scores), out->entries, msg)) {
-        set_err(err, err_len, msg);
+        log_err(msg);
         return 1;
     }
     return 0;
@@ -1044,10 +1079,9 @@ int32_t system_one_answers_from_scores(const system_one_plan * plan,
 
 int32_t system_one_label_tokens(const llama_vocab * vocab,
                                 const char * const * labels, size_t n_labels,
-                                llama_token * out,
-                                char * err, size_t err_len) {
+                                llama_token * out) {
     if (vocab == nullptr || labels == nullptr || out == nullptr) {
-        set_err(err, err_len, "no vocab, no labels or no output");
+        log_err("no vocab, no labels or no output");
         return 1;
     }
 
@@ -1060,7 +1094,7 @@ int32_t system_one_label_tokens(const llama_vocab * vocab,
     std::vector<llama_token> ids;
     std::string bad;
     if (!label_tokens(vocab, names, ids, &bad)) {
-        set_err(err, err_len, "the answer label \"" + bad + "\" is not a single token for this tokenizer");
+        log_err("the answer label \"" + bad + "\" is not a single token for this tokenizer");
         return 1;
     }
 

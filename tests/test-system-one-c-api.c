@@ -139,24 +139,25 @@ int main(void) {
         }
     }
 
-    // the error buffer: filled, terminated, and never written past
+    // every fallible call refuses a null argument with a code, and logs why
     {
-        char err[16];
-        memset(err, 'x', sizeof(err));
-
-        CHECK(system_one_label_tokens(NULL, NULL, 0, NULL, err, sizeof(err)) != 0);
-        printf("label_tokens with no vocab: err = \"%s\"\n", err);
-        CHECK(err[sizeof(err) - 1] == '\0');
-        CHECK(strlen(err) < sizeof(err));
-
-        // a NULL buffer is allowed and must not crash
-        CHECK(system_one_label_tokens(NULL, NULL, 0, NULL, NULL, 0) != 0);
-
-        CHECK(system_one_answers_from_scores(NULL, NULL, 0, NULL, err, sizeof(err)) != 0);
-        CHECK(system_one_params_init_from_model(NULL, err, sizeof(err)) == NULL);
-        CHECK(system_one_plan_init(NULL, NULL, "x", NULL, 0, err, sizeof(err)) == NULL);
-        CHECK(system_one_plan_tokenize(NULL, NULL, NULL, err, sizeof(err)) != 0);
+        CHECK(system_one_label_tokens(NULL, NULL, 0, NULL) != 0);
+        CHECK(system_one_answers_from_scores(NULL, NULL, 0, NULL) != 0);
+        CHECK(system_one_answers_from_logits(NULL, NULL, 0, NULL) != 0);
+        CHECK(system_one_resolve_question_slots(NULL, NULL, NULL, 0, 0, NULL) != 0);
+        CHECK(system_one_params_init_from_model(NULL) == NULL);
+        CHECK(system_one_plan_init(NULL, NULL, "x", NULL, 0) == NULL);
+        CHECK(system_one_plan_tokenize(NULL, NULL, NULL) != 0);
         printf("null-argument guards: ok\n");
+    }
+
+    // an answer handed to system_one_answers_add() is owned by it either way -- including
+    // when there is no list to store it in, which must not leak
+    {
+        const float scores[] = { 1.0f, 2.0f };
+        system_one_answers_add(NULL, system_one_answer_init_from_scores(scores, 2));
+        system_one_answers_add(NULL, NULL);
+        printf("answers_add ownership on a null list: ok\n");
     }
 
     if (n_failed > 0) {

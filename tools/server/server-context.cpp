@@ -2219,7 +2219,9 @@ private:
         queue_results.send(std::move(res));
     }
 
-    void send_system_one(const server_slot & slot) {
+    // takes the slot's answers rather than copying them out, which is why the slot is not
+    // const here: they are the library's objects and there is no reason for two of each
+    void send_system_one(server_slot & slot) {
         auto res = std::make_unique<server_task_result_system_one>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
@@ -2233,11 +2235,13 @@ private:
                 send_error(slot, "System One: an answer slot was never decoded", ERROR_TYPE_SERVER);
                 return;
             }
-            const system_one_answer * a = slot.so_answers[qi].get();
-            res->logits.push_back(system_one::logits_of(a));
-            res->probs.push_back(system_one::probs_of(a));
-            res->choice.push_back(system_one_answer_get_choice(a));
-            res->confidence.push_back(system_one_answer_get_confidence(a));
+        }
+
+        // the slot collects them out of order -- an answer slot can be decoded before the
+        // sub-batch that finishes the prompt -- so they are only put in question order here
+        res->answers.reset(system_one_answers_init());
+        for (size_t qi = 0; qi < n_questions; qi++) {
+            system_one_answers_add(res->answers.get(), slot.so_answers[qi].release());
         }
 
         SLT_DBG(slot, "sending System One result for %zu question(s)\n", n_questions);
@@ -5378,11 +5382,10 @@ void server_routes::init_routes() {
         const bool has_tmpl_override = body.contains("template") && body.at("template").is_string();
 
         std::string err;
-        system_one::error_buffer eb;
-        system_one::params_ptr cfg(system_one_params_init_from_model(ctx_server.model_tgt, eb.data(), eb.size()));
+            system_one::params_ptr cfg(system_one_params_init_from_model(ctx_server.model_tgt));
         if (!cfg) {
             if (!has_tmpl_override) {
-                res->error(format_error_response(eb.str(), ERROR_TYPE_NOT_SUPPORTED));
+                res->error(format_error_response("this model has no System One template (see the server log)", ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
             cfg.reset(system_one_params_init());
@@ -5422,7 +5425,7 @@ void server_routes::init_routes() {
         std::string state;
         std::vector<raw_buffer> state_files;
         if (body.contains("state")) {
-const json & st = body.at("state");
+            const json & st = body.at("state");
 
             if (st.is_array()) {
                 // OpenAI-style content parts. The text lands in the state with a media marker
@@ -5552,10 +5555,9 @@ const json & st = body.at("state");
 
         if (!state_files.empty()) {
             system_one::plan_ptr lay(system_one_plan_init(cfg.get(), ctx_server.vocab, state.c_str(),
-                                                          questions.c_ptr(), questions.size(),
-                                                          eb.data(), eb.size()));
+                                                          questions.c_ptr(), questions.size()));
             if (!lay) {
-                res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
+                res->error(format_error_response("the request could not be rendered into a prompt (see the server log)", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
             if (system_one_plan_get_rank_pooling(lay.get())) {
@@ -5614,9 +5616,8 @@ const json & st = body.at("state");
             system_one::tokenized_ptr q_tok(system_one_tokenized_init());
             if (system_one_resolve_question_slots(ctx_server.vocab, cfg.get(),
                                                   q_segments.data(), q_segments.size(),
-                                                  media_tokens.size(), q_tok.get(),
-                                                  eb.data(), eb.size()) != 0) {
-                res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
+                                                  media_tokens.size(), q_tok.get()) != 0) {
+                res->error(format_error_response("the question blocks could not be placed after the state (see the server log)", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
             media_slots = system_one::slots_of(q_tok.get());
@@ -5624,11 +5625,9 @@ const json & st = body.at("state");
         }
 
         system_one::plan_ptr plan(system_one_plan_init(cfg.get(), ctx_server.vocab, state.c_str(),
-                                                       questions.c_ptr(), questions.size(),
-                                                       eb.data(), eb.size()));
-        if (!plan || system_one_plan_tokenize(plan.get(), ctx_server.vocab, cfg.get(),
-                                              eb.data(), eb.size()) != 0) {
-            res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
+                                                       questions.c_ptr(), questions.size()));
+        if (!plan || system_one_plan_tokenize(plan.get(), ctx_server.vocab, cfg.get()) != 0) {
+            res->error(format_error_response("the request could not be rendered into a prompt (see the server log)", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 
@@ -5679,8 +5678,8 @@ const json & st = body.at("state");
             }
 
             if (system_one_answers_from_scores(plan.get(), scores.data(), scores.size(),
-                                               answers.get(), eb.data(), eb.size()) != 0) {
-                res->error(format_error_response(eb.str(), ERROR_TYPE_SERVER));
+                                               answers.get()) != 0) {
+                res->error(format_error_response("the scores did not match the plan (see the server log)", ERROR_TYPE_SERVER));
                 return res;
             }
         } else {
@@ -5716,15 +5715,9 @@ const json & st = body.at("state");
             auto * so_res = dynamic_cast<server_task_result_system_one *>(result.get());
             GGML_ASSERT(so_res != nullptr);
 
-            // An answer is entirely determined by its own logits -- probabilities, argmax and
-            // confidence all follow -- so rebuilding it here is the same arithmetic the slot
-            // already did, not a second opinion about it.
-            for (const auto & one_logits : so_res->logits) {
-                system_one_answers_add(answers.get(),
-                    system_one_answer_init_from_scores(one_logits.data(), one_logits.size()));
-            }
-            n_tokens_in = so_res->n_tokens;
-            n_cached    = so_res->n_cached;
+            answers      = std::move(so_res->answers);
+            n_tokens_in  = so_res->n_tokens;
+            n_cached     = so_res->n_cached;
             res->rd.stop(); // nothing else to wait for
 
             if (system_one_answers_size(answers.get()) != keys.size()) {
@@ -5735,14 +5728,13 @@ const json & st = body.at("state");
 
         // one shape for every readout: the answer is a distribution over this question's own
         // options, plus the raw numbers the model produced
+        // the model ships with its own T already folded into the weights, so this only moves
+        // when the caller has recalibrated on a distribution of its own
+        system_one_answers_apply_temperature(answers.get(), temperature);
+
         json answers_json = json::object();
         for (size_t qi = 0; qi < keys.size(); qi++) {
-            // the list owns its entries; rescaling one is a write, which is why the const comes
-            // off. The model ships with its own T already folded into the weights, so this only
-            // moves when the caller has recalibrated on a distribution of its own.
-            system_one_answer * a = const_cast<system_one_answer *>(system_one_answers_get(answers.get(), qi));
-            system_one_answer_apply_temperature(a, temperature);
-
+            const system_one_answer * a = system_one_answers_get(answers.get(), qi);
             const std::vector<float> probs = system_one::probs_of(a);
 
             json one = json::object();

@@ -1501,18 +1501,19 @@ json server_task_result_rerank::to_json() {
 json server_task_result_system_one::to_json() {
     // a flat debug view; the route reshapes this into the Jev answers object, because it
     // is the route that knows the question keys, kinds and criteria
-    json answers = json::array();
-    for (size_t i = 0; i < probs.size(); i++) {
-        answers.push_back(json {
-            {"choice",      choice.size()     > i ? choice[i]     : -1},
-            {"confidence",  confidence.size() > i ? confidence[i] : 0.0f},
-            {"probs",       probs[i]},
-            {"logits",      logits.size()     > i ? logits[i] : std::vector<float>{}},
+    json out = json::array();
+    for (size_t i = 0; i < system_one_answers_size(answers.get()); i++) {
+        const system_one_answer * a = system_one_answers_get(answers.get(), i);
+        out.push_back(json {
+            {"choice",      system_one_answer_get_choice(a)},
+            {"confidence",  system_one_answer_get_confidence(a)},
+            {"probs",       system_one::probs_of(a)},
+            {"logits",      system_one::logits_of(a)},
         });
     }
     return json {
         {"index",            index},
-        {"answers",          answers},
+        {"answers",          out},
         {"tokens_evaluated", n_tokens},
         {"tokens_cached",    n_cached},
     };
