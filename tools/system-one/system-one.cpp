@@ -48,15 +48,6 @@ const char * system_one_readout_name(enum system_one_readout readout) {
     }
 }
 
-// The GGUF spells the readout the way the spec does, which is the only place the strings are
-// still the interface; everything downstream compares the enum.
-static bool readout_from_name(const std::string & name, enum system_one_readout & out) {
-    if (name == "letter_slot") { out = SYSTEM_ONE_READOUT_LETTER_SLOT; return true; }
-    if (name == "masked_slot") { out = SYSTEM_ONE_READOUT_MASKED_SLOT; return true; }
-    if (name == "rank_head")   { out = SYSTEM_ONE_READOUT_RANK_HEAD;   return true; }
-    return false;
-}
-
 system_one_params system_one_params_from_model(const llama_model * model) {
     system_one_params out;
     const char * tmpl = llama_model_chat_template(model, "system_one");
@@ -74,8 +65,7 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     // Asked of capabilities, never of the architecture name -- llama_model_cls_label() returns
     // null unless the model declares classifier labels, and causal attention is a kv every
     // converter already writes. Verified to reproduce the declared readout on every System One
-    // checkpoint we have. An explicit system_one.readout still wins, for a checkpoint the rule
-    // would get wrong.
+    // checkpoint we have.
     {
         std::string arch;
         bool causal = true;
@@ -93,11 +83,6 @@ system_one_params system_one_params_from_model(const llama_model * model) {
                                    : SYSTEM_ONE_READOUT_MASKED_SLOT);
     }
 
-    if (meta_str(model, "system_one.readout", s) && !s.empty()) {
-        if (!readout_from_name(s, out.readout)) {
-            throw std::runtime_error("unsupported system_one.readout: " + s);
-        }
-    }
     if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
     if (meta_str(model, "system_one.labels", s) && !s.empty()) out.labels = split_array(s);
 

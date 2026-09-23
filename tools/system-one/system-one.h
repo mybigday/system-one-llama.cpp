@@ -80,7 +80,7 @@ struct system_one_params {
 
     // Derived from the model's capabilities in system_one_params_from_model(), not required
     // in the GGUF: a classification head means RANK_HEAD, a bidirectional model means
-    // MASKED_SLOT, and a causal one means LETTER_SLOT. system_one.readout overrides it.
+    // MASKED_SLOT, and a causal one means LETTER_SLOT.
     enum system_one_readout readout = SYSTEM_ONE_READOUT_LETTER_SLOT;
 
     // system_one.labels: option i is labelled labels[i] and that token is what gets read.

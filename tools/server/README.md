@@ -793,6 +793,78 @@ curl http://127.0.0.1:8012/v1/rerank \
     }' | jq
 ```
 
+### POST `/v1/systemone`: Typed decisions (System One models)
+
+Answers a set of typed questions about a state in one forward pass, returning a calibrated
+distribution per question rather than text. Requires a model carrying a System One template
+(see [tools/system-one](../system-one/README.md)), and `--n-outputs-max-per-seq N` set to at
+least the number of questions a request may ask, since the server otherwise budgets one output
+per sequence.
+
+*Options:*
+
+`state`: the context the questions are asked about -- a string, a JSON object, or an array of
+OpenAI-style content parts (`text`, `image_url`, `input_audio`) for a multimodal model.
+
+`questions`: an object keyed by whatever the caller wants the answers keyed by. Each is
+`{"type": "noul" | "choice" | "score", "instructions": "...", "criteria": ...}`, where
+`criteria` is an object of option key to description for `choice`, an array of levels in order
+for `score`, and absent for `noul`.
+
+`temperature`: optional, one value for the whole request (default 1, which is skipped). A
+checkpoint ships with its calibration folded into its weights; this is for a caller that has
+fitted a T on its own distribution.
+
+`template`, `labels`: optional overrides for a model that carries no System One metadata, or
+whose format the caller is replacing. Labels say where an answer is read, so a template that
+writes `(1)(2)(3)` needs both.
+
+*Aliases:*
+  - `/systemone`
+
+*Examples:*
+
+```shell
+curl http://127.0.0.1:8012/v1/systemone \
+    -H "Content-Type: application/json" \
+    -d '{
+        "state": "Support ticket: I was charged twice for the same subscription. Please refund the duplicate.",
+        "questions": {
+            "refund":  {"type": "noul", "instructions": "The customer is asking for a refund."},
+            "queue":   {"type": "choice", "instructions": "Which team should handle this ticket?",
+                        "criteria": {"billing": "payments and refunds", "technical": "a product fault",
+                                     "account": "login or profile settings"}},
+            "urgency": {"type": "score", "instructions": "How urgent is this?",
+                        "criteria": ["routine", "soon", "urgent", "critical"]}
+        }
+    }' | jq
+```
+
+```json
+{
+  "model": "...",
+  "answers": {
+    "refund":  {"noul": 0.9141, "confidence": 0.5775, "logits": [9.7280, 12.0933]},
+    "queue":   {"choice": "billing",
+                "probabilities": {"billing": 0.9824, "technical": 0.0129, "account": 0.0046},
+                "confidence": 0.9104, "logits": [13.4224, 9.0917, 8.0633]},
+    "urgency": {"score": 1.8675, "legend": ["routine", "soon", "urgent", "critical"],
+                "probabilities": [0.0802, 0.0803, 0.7312, 0.1083],
+                "confidence": 0.3691, "logits": [9.8189, 9.8197, 12.0286, 10.1188]}
+  },
+  "usage": {"input_tokens": 138, "output_tokens": 0, "cached_tokens": 0, "sequences": 1}
+}
+```
+
+`output_tokens` is always 0: nothing is generated. `cached_tokens` reports how much of the
+prompt was served from the KV cache, which is how a streaming caller can see prefix reuse
+happening instead of inferring it from latency. Reuse needs the state to grow at its tail and,
+on a sliding-window model, `--swa-full`; it is always 0 for a bidirectional checkpoint, where
+every position depends on what follows it.
+
+A model whose answers come from a classification head (`rank_head`) runs one sequence per
+option, so it needs `--reranking` and costs K forward passes for a K-option question.
+
 ### POST `/infill`: For code infilling.
 
 Takes a prefix and a suffix and returns the predicted completion as stream.

@@ -3,9 +3,9 @@
 // A System One model does not write text. Give it a state and a set of typed questions and
 // it returns, in one forward pass, a distribution over each question's declared options:
 //
-//   llama-system-one -m model.gguf --state "I'd like two burgers, hold the drink" \
-//       --noul   "done:Has the customer finished ordering?" \
-//       --choice "item:What is the main item?:burger=a burger,fries=fries,drink=a drink" \
+//   llama-system-one -m model.gguf --state "I'd like two burgers, hold the drink"
+//       --noul   "done:Has the customer finished ordering?"
+//       --choice "item:What is the main item?:burger=a burger,fries=fries,drink=a drink"
 //       --score  "mood:How satisfied do they sound?:angry,unhappy,neutral,happy,delighted"
 //
 // The same request can be given as the JSON body the server's /v1/systemone route takes

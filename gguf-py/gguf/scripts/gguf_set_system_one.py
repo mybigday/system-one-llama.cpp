@@ -7,9 +7,8 @@ a file patched this way is indistinguishable from one converted with a sidecar.
 
     gguf_set_system_one.py in.gguf out.gguf \\
         --system-one-template template.jinja \\
-        --set system_one.readout=letter_slot \\
-        --set system_one.slot=last_token_of_question_segment \\
-        --set 'system_one.template.segment_separator=\\x1e'
+        --set 'system_one.labels=A,B,C' \\
+        --set 'system_one.segment_separator=\\x1e'
 
 or copy the values from a sidecar:
 

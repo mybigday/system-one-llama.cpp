@@ -25,18 +25,17 @@ TEMPLATE_NAME = "system_one"
 TEMPLATE_KEY = Keys.Tokenizer.CHAT_TEMPLATE_N.format(name=TEMPLATE_NAME)
 
 SCHEMA: dict[str, str] = {
-    "system_one.readout":           "str",    # letter_slot | masked_slot -- this also says where
-                                              # the answer sits, so there is no second key for it
     "system_one.labels":            "array",  # the answer alphabet: option i is labelled
                                               # labels[i], and that token is what gets read
     "system_one.segment_separator": "str",    # marks the tokenizer seams in the render;
                                               # defaults to U+001E when absent
 }
 
-# Nothing is required: the readout is derived from the model's own capabilities (a
-# classification head means rank_head, a bidirectional model means masked_slot, otherwise
-# letter_slot), and labels and segment_separator override their defaults. A template still has
-# to be there, but it is a named chat template rather than a system_one.* key.
+# Nothing is required, and the readout is not a key at all: it is derived from the model's own
+# capabilities (a classification head means rank_head, a bidirectional model means masked_slot,
+# otherwise letter_slot), which every System One checkpoint so far agrees with. labels and
+# segment_separator override their defaults. A template still has to be there, but it is a
+# named chat template rather than a system_one.* key.
 REQUIRED: tuple[str, ...] = ()
 
 _ESCAPES = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[nrt0\\])")
