@@ -87,7 +87,7 @@ static void parse_options(const std::string & rest, bool with_descs,
 // The flags and the JSON body describe the same thing; both land here.
 static bool collect_questions(const common_params & params,
                               std::vector<std::string> & keys,
-                              std::vector<system_one::question> & qs,
+                              std::vector<system_one_question> & qs,
                               std::string & state,
                               std::vector<std::string> & cfg_labels,
                               float & temperature,
@@ -133,12 +133,12 @@ static bool collect_questions(const common_params & params,
             }
 
             const std::string type = q.value("type", "noul");
-            system_one::question out;
+            system_one_question out;
             out.text = q.value("instructions", "");
             if (type == "noul") {
-                out.k = system_one::kind::noul;
+                out.kind = SYSTEM_ONE_KIND_NOUL;
             } else if (type == "choice") {
-                out.k = system_one::kind::choice;
+                out.kind = SYSTEM_ONE_KIND_CHOICE;
                 if (!q.contains("criteria") || !q.at("criteria").is_object()) {
                     err = "choice question \"" + item.key() + "\" needs a \"criteria\" object";
                     return false;
@@ -148,7 +148,7 @@ static bool collect_questions(const common_params & params,
                     out.descs.push_back(c.value().is_string() ? c.value().get<std::string>() : std::string());
                 }
             } else if (type == "score") {
-                out.k = system_one::kind::score;
+                out.kind = SYSTEM_ONE_KIND_SCORE;
                 if (!q.contains("criteria") || !q.at("criteria").is_array()) {
                     err = "score question \"" + item.key() + "\" needs a \"criteria\" array of levels";
                     return false;
@@ -167,8 +167,8 @@ static bool collect_questions(const common_params & params,
     for (const auto & spec : params.so_noul) {
         std::string key, instr, rest;
         if (!split_spec(spec, key, instr, rest)) { err = "--noul wants KEY:INSTRUCTIONS"; return false; }
-        system_one::question q;
-        q.k = system_one::kind::noul;
+        system_one_question q;
+        q.kind = SYSTEM_ONE_KIND_NOUL;
         q.text = instr;
         keys.push_back(key);
         qs.push_back(std::move(q));
@@ -179,8 +179,8 @@ static bool collect_questions(const common_params & params,
             err = "--choice wants KEY:INSTRUCTIONS:opt[=desc][,opt[=desc]...]";
             return false;
         }
-        system_one::question q;
-        q.k = system_one::kind::choice;
+        system_one_question q;
+        q.kind = SYSTEM_ONE_KIND_CHOICE;
         q.text = instr;
         parse_options(rest, true, q.options, q.descs);
         keys.push_back(key);
@@ -192,8 +192,8 @@ static bool collect_questions(const common_params & params,
             err = "--score wants KEY:INSTRUCTIONS:level[,level...]";
             return false;
         }
-        system_one::question q;
-        q.k = system_one::kind::score;
+        system_one_question q;
+        q.kind = SYSTEM_ONE_KIND_SCORE;
         q.text = instr;
         parse_options(rest, false, q.options, q.descs);
         keys.push_back(key);
@@ -207,8 +207,8 @@ static bool collect_questions(const common_params & params,
 // its scheduler instead; neither is more correct, they just own different batching.
 
 // The slot readouts: one decode over the whole sequence, logits asked for at the answer slots.
-static bool decode_slots(llama_context * ctx, const system_one::plan & p,
-                         std::vector<system_one::answer> & out, std::string & err) {
+static bool decode_slots(llama_context * ctx, const system_one_plan & p,
+                         std::vector<system_one_answer> & out, std::string & err) {
     const auto & t = p.sequences.front().tok;
 
     llama_batch batch = llama_batch_init((int32_t) t.ids.size(), 0, 1);
@@ -243,7 +243,7 @@ static bool decode_slots(llama_context * ctx, const system_one::plan & p,
             err = "no logits at answer slot " + std::to_string(qi);
             return false;
         }
-        out.push_back(system_one::answer_from_logits(row, p.labels, p.n_options[qi]));
+        out.push_back(system_one_answer_from_logits(row, p.labels, p.n_options[qi]));
     }
     return true;
 }
@@ -256,8 +256,8 @@ static bool decode_slots(llama_context * ctx, const system_one::plan & p,
 // When the plan says the sequences may share their prefix -- the state and the question, which
 // only a causal model can share because a bidirectional one recomputes them from what follows
 // -- the head is decoded once and its KV copied, so the state costs one pass instead of K.
-static bool decode_ranked(llama_context * ctx, const system_one::plan & p,
-                          std::vector<system_one::answer> & out, std::string & err) {
+static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
+                          std::vector<system_one_answer> & out, std::string & err) {
     const uint32_t n_ubatch  = llama_n_ubatch(ctx);
     const uint32_t n_seq_max = llama_n_seq_max(ctx);
 
@@ -347,7 +347,7 @@ static bool decode_ranked(llama_context * ctx, const system_one::plan & p,
         i += n_seq;
     }
 
-    return system_one::answers_from_scores(p, scores, out, err);
+    return system_one_answers_from_scores(p, scores, out, err);
 }
 
 int main(int argc, char ** argv) {
@@ -370,9 +370,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    system_one::so_config cfg;
+    system_one_params cfg;
     std::string err;
-    if (!system_one::so_config::from_model(model, cfg, err)) {
+    if (!system_one_params_from_model(model, cfg, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_model_free(model);
         return 1;
@@ -393,7 +393,7 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<std::string>           keys;
-    std::vector<system_one::question>  qs;
+    std::vector<system_one_question>  qs;
     std::vector<std::string> req_labels;
     float                    req_temperature = 1.0f;
     if (!collect_questions(params, keys, qs, state, req_labels, req_temperature, err)) {
@@ -407,7 +407,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    system_one::plan plan;
+    system_one_plan plan;
     if (!params.so_labels.empty()) {
         req_labels = string_split<std::string>(params.so_labels, ',');
     }
@@ -418,8 +418,8 @@ int main(int argc, char ** argv) {
         cfg.labels_are_default = false;
     }
 
-    if (!system_one::build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
-        !system_one::tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
+    if (!system_one_build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
+        !system_one_tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_model_free(model);
         return 1;
@@ -427,7 +427,7 @@ int main(int argc, char ** argv) {
 
     // What the checkpoint's readout needs of the context, applied here rather than by the
     // library, so every value the context is built with is visible at this one place.
-    const system_one::context_needs need = system_one::required_context(cfg);
+    const system_one_context_needs need = system_one_required_context(cfg);
 
     if (need.embeddings) {
         params.embedding = true;
@@ -466,7 +466,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<system_one::answer> answers;
+    std::vector<system_one_answer> answers;
     const bool ok = plan.rank_pooling ? decode_ranked(ctx, plan, answers, err)
                                       : decode_slots (ctx, plan, answers, err);
     if (!ok) {
@@ -479,7 +479,7 @@ int main(int argc, char ** argv) {
     // case, costs nothing. The model's own T is already folded into its weights.
     const float t = params.so_temperature > 0.0f ? params.so_temperature : req_temperature;
     for (auto & a : answers) {
-        system_one::apply_temperature(a, t);
+        system_one_apply_temperature(a, t);
     }
 
     // One rendering loop for every readout: the answers arrived in request order either way.
@@ -491,11 +491,11 @@ int main(int argc, char ** argv) {
         const auto & a = answers[qi];
         const auto & q = qs[qi];
         json ja;
-        switch (q.k) {
-            case system_one::kind::noul:
+        switch (q.kind) {
+            case SYSTEM_ONE_KIND_NOUL:
                 ja["noul"] = a.probs.size() > 1 ? a.probs[1] : 0.0f;
                 break;
-            case system_one::kind::choice: {
+            case SYSTEM_ONE_KIND_CHOICE: {
                 ja["choice"] = q.options[a.choice];
                 json probs;
                 for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
@@ -503,8 +503,8 @@ int main(int argc, char ** argv) {
                 }
                 ja["probabilities"] = probs;
             } break;
-            case system_one::kind::score:
-                ja["score"]         = system_one::score_expectation(a);
+            case SYSTEM_ONE_KIND_SCORE:
+                ja["score"]         = system_one_score_expectation(a);
                 ja["legend"]        = q.options;
                 ja["probabilities"] = a.probs;
                 break;
@@ -529,20 +529,20 @@ int main(int argc, char ** argv) {
             const auto & a = answers[qi];
             const auto & q = qs[qi];
             LOG("\n%s  (%s, confidence %.3f)\n", keys[qi].c_str(),
-                q.k == system_one::kind::noul   ? "noul"   :
-                q.k == system_one::kind::choice ? "choice" : "score", a.confidence);
-            switch (q.k) {
-                case system_one::kind::noul:
+                q.kind == SYSTEM_ONE_KIND_NOUL   ? "noul"   :
+                q.kind == SYSTEM_ONE_KIND_CHOICE ? "choice" : "score", a.confidence);
+            switch (q.kind) {
+                case SYSTEM_ONE_KIND_NOUL:
                     LOG("  P(true) = %.4f\n", a.probs.size() > 1 ? a.probs[1] : 0.0f);
                     break;
-                case system_one::kind::choice:
+                case SYSTEM_ONE_KIND_CHOICE:
                     LOG("  -> %s\n", q.options[a.choice].c_str());
                     for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
                         LOG("     %-24s %.4f\n", q.options[i].c_str(), a.probs[i]);
                     }
                     break;
-                case system_one::kind::score:
-                    LOG("  score = %.4f over %zu levels\n", system_one::score_expectation(a), q.options.size());
+                case SYSTEM_ONE_KIND_SCORE:
+                    LOG("  score = %.4f over %zu levels\n", system_one_score_expectation(a), q.options.size());
                     for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
                         LOG("     %-24s %.4f\n", q.options[i].c_str(), a.probs[i]);
                     }

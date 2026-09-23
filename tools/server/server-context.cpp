@@ -276,7 +276,7 @@ struct server_slot {
     // sit inside the prompt, so they can be decoded in an earlier sub-batch than the one
     // that finishes the prompt -- hence collecting as we go instead of reading at the end.
     std::vector<std::pair<int32_t, int32_t>> so_outputs;
-    std::vector<system_one::answer>          so_answers;
+    std::vector<system_one_answer>          so_answers;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -3922,7 +3922,7 @@ private:
             if (slot.task && slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.so_outputs.empty()) {
                 const auto & so = slot.task->system_one;
                 if (slot.so_answers.size() != so.slots.size()) {
-                    slot.so_answers.assign(so.slots.size(), system_one::answer{});
+                    slot.so_answers.assign(so.slots.size(), system_one_answer{});
                 }
                 for (const auto & [idx, qi] : slot.so_outputs) {
                     if (!is_inside_view(idx) || !slot.so_answers[qi].probs.empty()) {
@@ -3933,7 +3933,7 @@ private:
                         SLT_ERR(slot, "failed to get logits for answer slot %d\n", idx);
                         continue;
                     }
-                    slot.so_answers[qi] = system_one::answer_from_logits(row, so.letters, so.n_options[qi]);
+                    slot.so_answers[qi] = system_one_answer_from_logits(row, so.letters, so.n_options[qi]);
                 }
             }
 
@@ -5375,14 +5375,14 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         const bool has_tmpl_override = body.contains("template") && body.at("template").is_string();
 
-        system_one::so_config cfg;
+        system_one_params cfg;
         std::string err;
-        if (!system_one::so_config::from_model(ctx_server.model_tgt, cfg, err)) {
+        if (!system_one_params_from_model(ctx_server.model_tgt, cfg, err)) {
             if (!has_tmpl_override) {
                 res->error(format_error_response(err, ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            cfg = system_one::so_config();
+            cfg = system_one_params();
         }
         if (has_tmpl_override) {
             cfg.template_src = body.at("template").get<std::string>();
@@ -5468,7 +5468,7 @@ const json & st = body.at("state");
         std::vector<std::string>              keys;
         std::vector<std::string>              kinds;
         std::vector<std::vector<std::string>> options;
-        std::vector<system_one::question>     questions;
+        std::vector<system_one_question>     questions;
 
         // one temperature for the request, because calibration is a property of the
         // deployment rather than of a question: a caller fits it on its own distribution
@@ -5489,13 +5489,13 @@ const json & st = body.at("state");
             }
 
             const std::string type = json_value(q, "type", std::string("noul"));
-            system_one::question out;
+            system_one_question out;
             out.text = json_value(q, "instructions", std::string());
 
             if (type == "noul") {
                 // the two sides of a yes/no question are an API convention, not a model fact:
                 // a caller can name them through criteria, and the template can word them
-                out.k       = system_one::kind::noul;
+                out.kind       = SYSTEM_ONE_KIND_NOUL;
                 out.options = {"no", "yes"};
                 if (q.contains("criteria") && q.at("criteria").is_object()) {
                     out.descs.assign(out.options.size(), std::string());
@@ -5504,7 +5504,7 @@ const json & st = body.at("state");
                     if (c.contains("true"))  out.descs[1] = c.at("true").get<std::string>();
                 }
             } else if (type == "choice") {
-                out.k = system_one::kind::choice;
+                out.kind = SYSTEM_ONE_KIND_CHOICE;
                 if (!q.contains("criteria") || !q.at("criteria").is_object()) {
                     res->error(format_error_response("choice question \"" + key + "\" needs a \"criteria\" object", ERROR_TYPE_INVALID_REQUEST));
                     return res;
@@ -5514,7 +5514,7 @@ const json & st = body.at("state");
                     out.descs.push_back(c.value().is_string() ? c.value().get<std::string>() : std::string());
                 }
             } else if (type == "score") {
-                out.k = system_one::kind::score;
+                out.kind = SYSTEM_ONE_KIND_SCORE;
                 if (!q.contains("criteria") || !q.at("criteria").is_array()) {
                     res->error(format_error_response("score question \"" + key + "\" needs a \"criteria\" array of levels", ERROR_TYPE_INVALID_REQUEST));
                     return res;
@@ -5544,8 +5544,8 @@ const json & st = body.at("state");
         std::vector<int> media_slots;
 
         if (!state_files.empty()) {
-            system_one::plan lay;
-            if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, lay, err)) {
+            system_one_plan lay;
+            if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, lay, err)) {
                 res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
@@ -5598,7 +5598,7 @@ const json & st = body.at("state");
 
             const std::vector<std::string> q_segments(ls.segments.begin() + first_question, ls.segments.end());
             std::vector<llama_token> q_ids;
-            if (!system_one::resolve_question_slots(ctx_server.vocab, cfg, q_segments,
+            if (!system_one_resolve_question_slots(ctx_server.vocab, cfg, q_segments,
                                                     media_tokens.size(), q_ids, media_slots, err)) {
                 res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
                 return res;
@@ -5606,14 +5606,14 @@ const json & st = body.at("state");
             media_tokens.insert(q_ids);
         }
 
-        system_one::plan plan;
-        if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, plan, err) ||
-            !system_one::tokenize_plan(ctx_server.vocab, cfg, plan, err)) {
+        system_one_plan plan;
+        if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, plan, err) ||
+            !system_one_tokenize_plan(ctx_server.vocab, cfg, plan, err)) {
             res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 
-        std::vector<system_one::answer> answers;
+        std::vector<system_one_answer> answers;
         int32_t n_tokens_in = 0;
         int32_t n_cached    = 0;   // stays 0 where the readout cannot reuse a prefix
 
@@ -5655,7 +5655,7 @@ const json & st = body.at("state");
                 }
             }
 
-            if (!system_one::answers_from_scores(plan, scores, answers, err)) {
+            if (!system_one_answers_from_scores(plan, scores, answers, err)) {
                 res->error(format_error_response(err, ERROR_TYPE_SERVER));
                 return res;
             }
@@ -5707,7 +5707,7 @@ const json & st = body.at("state");
 
             // the model ships with its own T already folded into the weights, so this only
             // moves when the caller has recalibrated on a distribution of its own
-            system_one::apply_temperature(a, temperature);
+            system_one_apply_temperature(a, temperature);
 
             json one = json::object();
             if (kinds[qi] == "noul") {
@@ -5718,7 +5718,7 @@ const json & st = body.at("state");
                 one["choice"]        = options[qi][a.choice];
                 one["probabilities"] = per_option;
             } else {
-                one["score"]         = system_one::score_expectation(a);
+                one["score"]         = system_one_score_expectation(a);
                 one["legend"]        = options[qi];
                 one["probabilities"] = a.probs;
             }

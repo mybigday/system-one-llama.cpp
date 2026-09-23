@@ -10,7 +10,6 @@
 
 using json = common_json;
 
-namespace system_one {
 
 // ---------------------------------------------------------------- model metadata
 
@@ -36,7 +35,24 @@ static std::vector<std::string> split_array(const std::string & s) {
     return out;
 }
 
-bool so_config::from_model(const llama_model * model, so_config & out, std::string & err) {
+const char * system_one_readout_name(enum system_one_readout readout) {
+    switch (readout) {
+        case SYSTEM_ONE_READOUT_MASKED_SLOT: return "masked_slot";
+        case SYSTEM_ONE_READOUT_RANK_HEAD:   return "rank_head";
+        default:                             return "letter_slot";
+    }
+}
+
+// The GGUF spells the readout the way the spec does, which is the only place the strings are
+// still the interface; everything downstream compares the enum.
+static bool readout_from_name(const std::string & name, enum system_one_readout & out) {
+    if (name == "letter_slot") { out = SYSTEM_ONE_READOUT_LETTER_SLOT; return true; }
+    if (name == "masked_slot") { out = SYSTEM_ONE_READOUT_MASKED_SLOT; return true; }
+    if (name == "rank_head")   { out = SYSTEM_ONE_READOUT_RANK_HEAD;   return true; }
+    return false;
+}
+
+bool system_one_params_from_model(const llama_model * model, system_one_params & out, std::string & err) {
     const char * tmpl = llama_model_chat_template(model, "system_one");
     if (tmpl == nullptr || tmpl[0] == '\0') {
         err = "model has no System One template (tokenizer.chat_template.system_one); "
@@ -67,10 +83,17 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
         const bool has_cls_head = llama_model_cls_label(model, 0) != nullptr;
         out.causal = causal;
 
-        out.readout = has_cls_head ? "rank_head" : (causal ? "letter_slot" : "masked_slot");
+        out.readout = has_cls_head ? SYSTEM_ONE_READOUT_RANK_HEAD
+                    : (causal      ? SYSTEM_ONE_READOUT_LETTER_SLOT
+                                   : SYSTEM_ONE_READOUT_MASKED_SLOT);
     }
 
-    if (meta_str(model, "system_one.readout", s) && !s.empty()) out.readout = s;
+    if (meta_str(model, "system_one.readout", s) && !s.empty()) {
+        if (!readout_from_name(s, out.readout)) {
+            err = "unsupported system_one.readout: " + s;
+            return false;
+        }
+    }
     if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
     if (meta_str(model, "system_one.labels", s) && !s.empty()) out.labels = split_array(s);
 
@@ -79,11 +102,6 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
         out.labels_are_default = true;
         for (char c = 'A'; c <= 'Z'; c++) out.labels.push_back(std::string(1, c));
         for (char c = 'a'; c <= 'z'; c++) out.labels.push_back(std::string(1, c));
-    }
-
-    if (out.readout != "letter_slot" && out.readout != "masked_slot" && out.readout != "rank_head") {
-        err = "unsupported system_one.readout: " + out.readout;
-        return false;
     }
 
     // the rest is ordinary model metadata
@@ -96,7 +114,7 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
     out.bos_text = piece(llama_vocab_bos(vocab));
     out.eos_text = piece(llama_vocab_eos(vocab));
 
-    if (out.masked()) {
+    if (out.readout == SYSTEM_ONE_READOUT_MASKED_SLOT) {
         out.mask_token = llama_vocab_mask(vocab);
         if (out.mask_token < 0) {
             err = "masked_slot needs the model's tokenizer.ggml.mask_token_id";
@@ -111,15 +129,15 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
 
 // ---------------------------------------------------------------- rendering
 
-static const char * kind_name(kind k) {
+static const char * kind_name(enum system_one_kind k) {
     switch (k) {
-        case kind::choice: return "choice";
-        case kind::score:  return "score";
+        case SYSTEM_ONE_KIND_CHOICE: return "choice";
+        case SYSTEM_ONE_KIND_SCORE:  return "score";
         default:           return "noul";
     }
 }
 
-static bool render_and_split(const so_config & cfg, const json & inp,
+static bool render_and_split(const system_one_params & cfg, const json & inp,
                              std::vector<std::string> & segments, std::string & err) {
     std::string rendered;
     try {
@@ -156,9 +174,9 @@ static bool render_and_split(const so_config & cfg, const json & inp,
     return true;
 }
 
-bool render_segments(const so_config & cfg,
+bool system_one_render_segments(const system_one_params & cfg,
                      const std::string & state,
-                     const std::vector<question> & qs,
+                     const std::vector<system_one_question> & qs,
                      std::vector<std::string> & segments,
                      std::string & err) {
     if (cfg.segment_separator.empty()) {
@@ -168,7 +186,7 @@ bool render_segments(const so_config & cfg,
 
     json questions = json::array();
     for (size_t i = 0; i < qs.size(); i++) {
-        const question & q = qs[i];
+        const system_one_question & q = qs[i];
         json options = json::array();
         for (size_t j = 0; j < q.options.size(); j++) {
             const bool has_desc = j < q.descs.size() && !q.descs[j].empty();
@@ -180,7 +198,7 @@ bool render_segments(const so_config & cfg,
         }
         questions.push_back(json{
             {"k",       (int) i + 1},          // 1-based, as templates count questions
-            {"kind",    kind_name(q.k)},
+            {"kind",    kind_name(q.kind)},
             {"text",    q.text},
             {"options", options},
         });
@@ -205,9 +223,9 @@ bool render_segments(const so_config & cfg,
     return true;
 }
 
-static bool render_pair_segments(const so_config & cfg,
+static bool render_pair_segments(const system_one_params & cfg,
                           const std::string & state,
-                          const question & q,
+                          const system_one_question & q,
                           size_t option_index,
                           std::vector<std::string> & segments,
                           std::string & err) {
@@ -220,7 +238,7 @@ static bool render_pair_segments(const so_config & cfg,
     const json inp = json{
         {"state", state},
         {"question", json{
-            {"kind", kind_name(q.k)},
+            {"kind", kind_name(q.kind)},
             {"text", q.text},
         }},
         {"option", json{
@@ -245,8 +263,8 @@ static bool render_pair_segments(const so_config & cfg,
 
 // ---------------------------------------------------------------- tokenization
 
-bool resolve_question_slots(const llama_vocab * vocab,
-                            const so_config & cfg,
+bool system_one_resolve_question_slots(const llama_vocab * vocab,
+                            const system_one_params & cfg,
                             const std::vector<std::string> & question_segments,
                             size_t prefix_positions,
                             std::vector<llama_token> & ids_out,
@@ -255,7 +273,7 @@ bool resolve_question_slots(const llama_vocab * vocab,
     ids_out.clear();
     slots_out.clear();
 
-    const bool masked = cfg.masked();
+    const bool masked = cfg.readout == SYSTEM_ONE_READOUT_MASKED_SLOT;
 
     for (size_t i = 0; i < question_segments.size(); i++) {
         // Special tokens -- BOS, a mask -- are written into the template as text and have to
@@ -289,11 +307,11 @@ bool resolve_question_slots(const llama_vocab * vocab,
     return true;
 }
 
-bool tokenize_segments(const llama_vocab * vocab,
-                       const so_config & cfg,
+bool system_one_tokenize_segments(const llama_vocab * vocab,
+                       const system_one_params & cfg,
                        const std::vector<std::string> & segments,
                        size_t n_questions,
-                       tokenized & out,
+                       system_one_tokenized & out,
                        std::string & err) {
     if (segments.size() < n_questions) {
         err = "fewer segments than questions";
@@ -316,14 +334,14 @@ bool tokenize_segments(const llama_vocab * vocab,
 
     std::vector<llama_token> q_ids;
     const std::vector<std::string> q_segments(segments.begin() + first_question, segments.end());
-    if (!resolve_question_slots(vocab, cfg, q_segments, out.ids.size(), q_ids, out.slots, err)) {
+    if (!system_one_resolve_question_slots(vocab, cfg, q_segments, out.ids.size(), q_ids, out.slots, err)) {
         return false;
     }
     out.ids.insert(out.ids.end(), q_ids.begin(), q_ids.end());
     return true;
 }
 
-bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
+bool system_one_label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
                   std::vector<llama_token> & out, std::string * bad) {
     // Tokenize each label rather than matching vocab text: a label is read at the position
     // where the template would have written it, so it has to be what the tokenizer produces
@@ -343,13 +361,13 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
 
 // ---------------------------------------------------------------- planning
 
-bool build_plan(const so_config & cfg,
+bool system_one_build_plan(const system_one_params & cfg,
                 const llama_vocab * vocab,
                 const std::string & state,
-                const std::vector<question> & qs_in,
-                plan & out,
+                const std::vector<system_one_question> & qs_in,
+                system_one_plan & out,
                 std::string & err) {
-    out = plan();
+    out = system_one_plan();
     if (qs_in.empty()) {
         err = "a request needs at least one question";
         return false;
@@ -358,10 +376,10 @@ bool build_plan(const so_config & cfg,
     // The two sides of a yes/no question are a property of the format, not of the caller:
     // every front end would otherwise have to know to spell them "no" and "yes". A caller
     // that wants them worded differently still may -- this only fills in the blank.
-    std::vector<question> qs;
+    std::vector<system_one_question> qs;
     qs.reserve(qs_in.size());
     for (auto q : qs_in) {
-        if (q.k == kind::noul && q.options.empty()) {
+        if (q.kind == SYSTEM_ONE_KIND_NOUL && q.options.empty()) {
             q.options = {"no", "yes"};
         }
         qs.push_back(std::move(q));
@@ -375,13 +393,13 @@ bool build_plan(const so_config & cfg,
         out.n_options.push_back((int) q.options.size());
     }
 
-    if (cfg.ranked()) {
+    if (cfg.readout == SYSTEM_ONE_READOUT_RANK_HEAD) {
         // the head scores a whole sequence, so each option gets one of its own
         out.rank_pooling = true;
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
             for (size_t oi = 0; oi < qs[qi].options.size(); oi++) {
-                plan::sequence seq;
+                system_one_sequence seq;
                 if (!render_pair_segments(cfg, state, qs[qi], oi, seq.segments, err)) return false;
                 seq.n_question_segments = 0;   // the head scores the sequence, nothing is read at a slot
                 seq.question = qi;
@@ -394,7 +412,7 @@ bool build_plan(const so_config & cfg,
 
     // a slot readout answers every question from one sequence
     std::string bad;
-    if (!label_tokens(vocab, cfg.labels, out.labels, &bad)) {
+    if (!system_one_label_tokens(vocab, cfg.labels, out.labels, &bad)) {
         err = "the answer label \"" + bad + "\" is not a single token for this tokenizer; "
               + (cfg.labels_are_default
                  ? "it comes from the default A-Za-z alphabet, not from anything this request "
@@ -412,17 +430,18 @@ bool build_plan(const so_config & cfg,
         }
     }
 
-    plan::sequence seq;
-    if (!render_segments(cfg, state, qs, seq.segments, err)) return false;
+    system_one_sequence seq;
+    if (!system_one_render_segments(cfg, state, qs, seq.segments, err)) return false;
     seq.n_question_segments = qs.size();
     out.sequences.push_back(std::move(seq));
 
     return true;
 }
 
-bool tokenize_plan(const llama_vocab * vocab, const so_config & cfg, plan & p, std::string & err) {
+bool system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params & cfg,
+                              system_one_plan & p, std::string & err) {
     for (auto & seq : p.sequences) {
-        if (!tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments, seq.tok, err)) {
+        if (!system_one_tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments, seq.tok, err)) {
             return false;
         }
     }
@@ -470,14 +489,14 @@ bool tokenize_plan(const llama_vocab * vocab, const so_config & cfg, plan & p, s
     return true;
 }
 
-bool answers_from_scores(const plan & p, const std::vector<float> & scores,
-                         std::vector<answer> & out, std::string & err) {
+bool system_one_answers_from_scores(const system_one_plan & p, const std::vector<float> & scores,
+                         std::vector<system_one_answer> & out, std::string & err) {
     if (scores.size() != p.sequences.size()) {
         err = "expected one score per planned sequence";
         return false;
     }
 
-    out.assign(p.n_options.size(), answer());
+    out.assign(p.n_options.size(), system_one_answer());
     std::vector<std::vector<float>> per_question(p.n_options.size());
     for (size_t i = 0; i < p.sequences.size(); i++) {
         const auto & seq = p.sequences[i];
@@ -493,7 +512,7 @@ bool answers_from_scores(const plan & p, const std::vector<float> & scores,
             err = "a question did not get one score per option";
             return false;
         }
-        out[qi] = answer_from_scores(per_question[qi]);
+        out[qi] = system_one_answer_from_scores(per_question[qi]);
     }
     return true;
 }
@@ -509,8 +528,8 @@ static std::vector<float> softmax(const std::vector<float> & x) {
     return p;
 }
 
-answer answer_from_scores(const std::vector<float> & scores) {
-    answer a;
+system_one_answer system_one_answer_from_scores(const std::vector<float> & scores) {
+    system_one_answer a;
     a.logits = scores;                 // the head's raw output, as the caller gets it
     a.probs  = softmax(scores);
     a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
@@ -526,14 +545,14 @@ answer answer_from_scores(const std::vector<float> & scores) {
     return a;
 }
 
-answer answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
+system_one_answer system_one_answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
     // the only difference between the two readouts is where the numbers come from
     std::vector<float> scores(n_options);
     for (int j = 0; j < n_options; j++) scores[j] = row[letter_ids[j]];
-    return answer_from_scores(scores);
+    return system_one_answer_from_scores(scores);
 }
 
-void apply_temperature(answer & a, float t) {
+void system_one_apply_temperature(system_one_answer & a, float t) {
     if (t <= 0.0f || std::fabs(t - 1.0f) <= 1e-6f || a.logits.empty()) {
         return;
     }
@@ -553,16 +572,16 @@ void apply_temperature(answer & a, float t) {
     }
 }
 
-float score_expectation(const answer & a) {
+float system_one_score_expectation(const system_one_answer & a) {
     double e = 0.0;
     for (size_t i = 0; i < a.probs.size(); i++) e += (double) i * (double) a.probs[i];
     return (float) e;
 }
 
-context_needs required_context(const so_config & cfg) {
-    context_needs need;
+system_one_context_needs system_one_required_context(const system_one_params & cfg) {
+    system_one_context_needs need;
 
-    if (cfg.ranked()) {
+    if (cfg.readout == SYSTEM_ONE_READOUT_RANK_HEAD) {
         // the answer is the classification head's output, which is reached as a pooled
         // embedding -- so the context has to compute embeddings, pooled as a rank score
         need.embeddings   = true;
@@ -572,4 +591,3 @@ context_needs required_context(const so_config & cfg) {
     return need;
 }
 
-} // namespace system_one
