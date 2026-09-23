@@ -1160,10 +1160,6 @@ class ModelBase:
         self.set_system_one_metadata()
 
     def set_system_one_metadata(self):
-        # Nothing is written unless asked for, so an ordinary model converts exactly as before.
-        # The template is a named chat template rather than a key of its own, and the other two
-        # are optional overrides of their defaults -- where the answer is read from is derived
-        # from the model's capabilities, not declared. See tools/system-one/README.md.
         if not self.system_one:
             return
 

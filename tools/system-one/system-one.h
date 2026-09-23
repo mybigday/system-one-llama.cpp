@@ -5,18 +5,13 @@
 // distribution over a small label set, which is what makes the output typed by
 // construction.
 //
-// The prompt format is a property of the checkpoint, not of this code. It is a Jinja
-// template stored in the GGUF as `system_one.template`, exactly like
-// `tokenizer.chat_template`, and rendered with llama.cpp's own Jinja engine. There is
-// deliberately NO built-in default: different System One lines (letter slots, a scoring
-// head taking one option per sequence, per-option mask tokens) need different prompts,
-// so a model without a template is an error rather than an assumption.
+// The prompt format belongs to the checkpoint: a Jinja template stored in the GGUF as the
+// named chat template `system_one`. There is no built-in default, so a model without one is
+// an error.
 //
-// Segment boundaries matter as much as the text. The reference implementation encodes
-// the state and each question block separately and concatenates the ids, which differs
-// from a single-pass tokenization at the seams. The template marks those seams with
-// `system_one.template.segment_separator` (U+001E); this side splits on it and
-// tokenizes each piece on its own.
+// The state and each question block are tokenized separately and concatenated, which differs
+// from a single-pass encode at the seams. The template marks those seams with
+// `system_one.segment_separator` (U+001E).
 
 #pragma once
 
@@ -25,23 +20,9 @@
 #include <string>
 #include <vector>
 
-// Errors are exceptions, the way common/chat.h reports them: these calls return what they
-// produce and throw std::invalid_argument when the request or the template as stated cannot be
-// answered, std::runtime_error when the checkpoint cannot or the numbers handed back do not fit
-// the plan. That split is not decoration -- llama-server wraps every route in `ex_wrapper`,
-// which turns invalid_argument into a 400 and anything else into a 500, both carrying what(),
-// so a route needs no error handling of its own to answer a malformed request correctly.
-//
-// This header builds the input and reads the output. Running the model is deliberately not
-// here: like common/chat.h, which renders a prompt and parses a reply but never calls
-// llama_decode, this is the format layer, and inference belongs to whoever owns the batching
-// -- the server's scheduler, or a CLI's own loop.
-//
-// Naming is flat and C-shaped -- `system_one_*` free functions, `system_one_params`, enums
-// spelled SYSTEM_ONE_* -- the convention llama.h uses and common/ follows (common_params,
-// common_chat_templates_apply). No namespace, no nested types, no member functions, so a
-// name here is the same name a C caller would write. The signatures still take std::string
-// and std::vector, which is what stands between this and an `extern "C"` header.
+// These calls throw: std::invalid_argument when the request or template as stated cannot be
+// answered, std::runtime_error when the checkpoint cannot, or when the numbers handed back do
+// not fit the plan.
 
 enum system_one_kind {
     SYSTEM_ONE_KIND_NOUL,
@@ -49,9 +30,7 @@ enum system_one_kind {
     SYSTEM_ONE_KIND_SCORE,
 };
 
-// Where an answer is read, and what is read there. A closed set: every readout needs its own
-// slot rule and its own way of turning numbers into a distribution, so a value outside it has
-// no implementation to reach.
+// Where an answer is read, and what is read there.
 //   LETTER_SLOT  the next-token distribution at the end of a question's segment
 //   MASKED_SLOT  the distribution at a mask token inside it (bidirectional models)
 //   RANK_HEAD    one sequence per option, scored by the model's classification head -- the
@@ -103,26 +82,19 @@ struct system_one_params {
 // Reads the metadata. Fails when the model carries no System One template.
 system_one_params system_one_params_from_model(const llama_model * model);
 
-// The stages below are exposed so the pipeline can be checked one step at a time against a
-// reference -- the regression harnesses compare the rendered text and the segment-wise ids
-// separately, which system_one_build_plan() alone could not tell apart.
-
-// Render the template, then split on the separator. The last `n_questions` segments are
-// the question blocks. `mask` is exposed to the template so a masked-slot format can place
-// its mask token, and the answer slot is then that token rather than the segment's end.
+// Render the template, then split on the separator. The last `n_questions` segments are the
+// question blocks.
 std::vector<std::string> system_one_render_segments(const system_one_params & cfg,
                                                     const std::string & state,
                                                     const std::vector<system_one_question> & qs);
 
 struct system_one_tokenized {
     std::vector<llama_token> ids;
-    std::vector<int>         slots;   // one per question: position of its "(" token
+    std::vector<int>         slots;   // one per question: where its answer is read
 };
 
 // One sequence the request turns into. A slot readout plans exactly one; a rank_head readout
-// plans one per option. Filled in two stages, because a caller may have to encode part of the
-// input itself: a state carrying images or audio is tokenized by whoever holds the mtmd
-// context, not here.
+// plans one per option.
 struct system_one_sequence {
     // stage one: what this sequence renders to. The trailing n_question_segments are the
     // question blocks; everything before them is the state.
@@ -200,45 +172,32 @@ struct system_one_answer {
 
 // Turn one row of vocab logits into a typed answer: gather the first `n_options` label
 // tokens, softmax over just those, argmax, and the entropy-normalised confidence.
-// Shared by the standalone tools and the server route so the math has one home.
 system_one_answer system_one_answer_from_logits(const float * row,
                                                 const std::vector<llama_token> & letter_ids,
                                                 int n_options);
 
-// Rescale an answer by a temperature and recompute everything that follows from it. The model
-// ships with its own T already folded into its weights, so this is for a caller recalibrating
-// on a distribution of its own; T = 1 is the common case and costs nothing, which is why it is
-// checked rather than applied.
+// Rescale an answer by a temperature and recompute the probabilities, argmax and confidence.
+// T = 1 returns immediately.
 void system_one_apply_temperature(system_one_answer & a, float t);
 
 // Expected value over an ordered rubric: sum(i * p_i), the `score` question type.
 float system_one_score_expectation(const system_one_answer & a);
 
-// Softmax over one question's option scores, with the same confidence measure the slot
-// readouts report. The scores come from the model's classification head, one per sequence.
+// The same, from one score per option -- what a classification head produces.
 system_one_answer system_one_answer_from_scores(const std::vector<float> & scores);
 
-// A whole request's answers in one call, which is where the two readouts differ and the only
-// place a caller should have to care which it has:
+// A whole request's answers in one call. The plan supplies the labels and the option counts,
+// so the caller only says where the numbers are:
 //
-//   _from_logits  a slot readout: one row of vocab logits per answer slot, in question order.
-//                 The plan says which label tokens to read and how many options each question
-//                 declared, so the caller handles neither.
-//   _from_scores  a rank_head readout: one score per planned sequence, in plan order. The plan
-//                 says which sequence scored which question's which option.
-//
-// system_one_answer_from_logits() below is the primitive these are built on, for a caller that
-// must read one row while it is briefly valid and cannot wait for the rest -- a server
-// collecting answers as sub-batches come back.
+//   _from_logits  a slot readout: one row of vocab logits per answer slot, in question order
+//   _from_scores  a rank_head readout: one score per planned sequence, in plan order
 std::vector<system_one_answer> system_one_answers_from_logits(const system_one_plan & p,
                                                               const std::vector<const float *> & rows);
 
 std::vector<system_one_answer> system_one_answers_from_scores(const system_one_plan & p,
                                                               const std::vector<float> & scores);
 
-// What the readout requires of a context -- not how big to make it, which is the caller's
-// business, but the part the checkpoint dictates: a rank_head answer is a classification
-// head's output, which is reached as a pooled embedding.
+// What the readout requires of a context: a rank_head answer is read from a pooled embedding.
 struct system_one_context_needs {
     bool                    embeddings   = false;
     enum llama_pooling_type pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;

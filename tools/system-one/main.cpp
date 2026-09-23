@@ -3,17 +3,13 @@
 // A System One model does not write text. Give it a state and a set of typed questions and
 // it returns, in one forward pass, a distribution over each question's declared options:
 //
-//   llama-system-one -m model.gguf --state "I'd like two burgers, hold the drink"
-//       --noul   "done:Has the customer finished ordering?"
-//       --choice "item:What is the main item?:burger=a burger,fries=fries,drink=a drink"
-//       --score  "mood:How satisfied do they sound?:angry,unhappy,neutral,happy,delighted"
+//   llama-system-one -m model.gguf --state "I was charged twice. Please refund the duplicate."
+//       --noul   "refund:The customer is asking for a refund."
+//       --choice "queue:Which team should handle this?:billing=refunds,technical=a fault"
+//       --score  "urgency:How urgent is this?:routine,soon,urgent,critical"
 //
-// The same request can be given as the JSON body the server's /v1/systemone route takes
-// (--system-one-request), which is the way to keep a prompt identical between the two front ends.
-//
-// Everything that depends on the checkpoint's readout -- how many sequences to run, which
-// tokens carry the answer, where the answer sits -- is decided by the system-one library,
-// not here. This file is an adapter: parse arguments, run what the plan asks for, print.
+// --system-one-request takes the same request as JSON, which is how a prompt is kept identical
+// between this and the server.
 
 #include "system-one.h"
 
@@ -115,7 +111,7 @@ static bool collect_questions(const common_params & params,
         if (req.contains("state")) {
             const json & st = req.at("state");
             if (st.is_array()) {
-                // reserved for content parts carrying media; see the note in the spec
+                // reserved for content parts carrying media
                 err = "\"state\" as a list of content parts is not supported yet -- pass a string or an object";
                 return false;
             }
@@ -128,7 +124,6 @@ static bool collect_questions(const common_params & params,
         for (const auto & item : req.at("questions").items()) {
             const auto & q = item.value();
             if (q.contains("temperature")) {
-                // it used to live here; saying so beats quietly returning uncalibrated numbers
                 err = "question \"" + item.key() + "\": \"temperature\" is one value for the whole request, not per question -- move it to the top level";
                 return false;
             }
@@ -203,10 +198,6 @@ static bool collect_questions(const common_params & params,
     return true;
 }
 
-// Running the plan is this tool's job, not the library's -- system-one.h builds the input and
-// reads the output, the same split common/chat.h has. The server drives the same plan through
-// its scheduler instead; neither is more correct, they just own different batching.
-
 // The slot readouts: one decode over the whole sequence, logits asked for at the answer slots.
 static std::vector<system_one_answer> decode_slots(llama_context * ctx, const system_one_plan & p) {
     const auto & t = p.sequences.front().tok;
@@ -234,8 +225,6 @@ static std::vector<system_one_answer> decode_slots(llama_context * ctx, const sy
         throw std::runtime_error("llama_decode failed with " + std::to_string(rc));
     }
 
-    // Which labels to read and how many options each question declared are the plan's to
-    // know; this loop only says where each answer's logits are.
     std::vector<const float *> rows(t.slots.size(), nullptr);
     for (size_t qi = 0; qi < t.slots.size(); qi++) {
         rows[qi] = llama_get_logits_ith(ctx, t.slots[qi]);
@@ -246,14 +235,12 @@ static std::vector<system_one_answer> decode_slots(llama_context * ctx, const sy
     return system_one_answers_from_logits(p, rows);
 }
 
-// rank_head: one sequence per option, scored by the model's head. They are independent, so as
-// many as the context allows share a decode. Two limits set the chunk size and both are asked
-// of the context: a sequence needs a seq_id of its own, and a bidirectional model cannot have
-// a sequence split across ubatches, so a whole chunk has to fit in one.
+// rank_head: one sequence per option, scored by the model's head. They are independent, so a
+// chunk of them shares a decode -- bounded by seq_id count, and by the ubatch, since a
+// bidirectional sequence cannot be split across one.
 //
-// When the plan says the sequences may share their prefix -- the state and the question, which
-// only a causal model can share because a bidirectional one recomputes them from what follows
-// -- the head is decoded once and its KV copied, so the state costs one pass instead of K.
+// Where the plan says the sequences share a prefix, it is decoded once and its KV copied, so
+// the state costs one pass instead of K.
 static std::vector<system_one_answer> decode_ranked(llama_context * ctx, const system_one_plan & p) {
     const uint32_t n_ubatch  = llama_n_ubatch(ctx);
     const uint32_t n_seq_max = llama_n_seq_max(ctx);
@@ -350,9 +337,7 @@ int main(int argc, char ** argv) {
     }
     common_init();
 
-    // The checkpoint decides the readout, and the readout decides how the context has to be
-    // built, so the model is loaded first and the context after -- the same order the server
-    // asks its capability questions in.
+    // The readout decides how the context has to be built, so the model is loaded first.
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -433,9 +418,8 @@ int main(int argc, char ** argv) {
         params.pooling_type = need.pooling_type;
     }
 
-    // How big to make the context is this tool's call, not the library's. Scoring one sequence
-    // per option wants them in one decode; this many at a time is enough to matter without a
-    // 255-option question demanding a 255-sequence micro-batch.
+    // Scoring one sequence per option wants them in one decode, capped so a 255-option
+    // question does not demand a 255-sequence micro-batch.
     const size_t n_seq = std::min<size_t>(plan.sequences.size(), MAX_BATCHED_SEQS);
     if (n_seq > 1) {
         size_t n_tok = 0;

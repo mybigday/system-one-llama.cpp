@@ -16,16 +16,6 @@ answers, and `llama-system-one`, a CLI over it.
 | `choice` | a distribution over declared options | routing, classification, intent |
 | `score` | a distribution over ordered levels, plus its index-weighted mean | severity, satisfaction, priority |
 
-A `score` is **a position on the level axis, not a fraction of anything**: `Σ i·pᵢ` over the
-levels' 0-based indices, so it runs `0 .. n_levels − 1`. With the four levels in the run below
-that axis is `0 routine, 1 soon, 2 urgent, 3 critical`, and 1.87 sits between `soon` and
-`urgent`, close to `urgent` -- it is not 1.87 out of 4.
-
-It comes with the distribution because neither is enough alone. The number is what you
-threshold, but it cannot tell a confident level from a flat spread: 1.5 is both "certainly
-halfway" and "no idea". The distribution says which. And the number only means anything if the
-levels are evenly spaced, which is an assumption the caller makes when it picks them.
-
 Every answer also carries `confidence = 1 − H(p)/ln K` and its raw logits, because calibration
 is the product: a consumer that only takes the argmax could have used anything.
 
@@ -104,10 +94,8 @@ JSON request is for, along with anything else more elaborate than a one-off from
 ## The prompt format belongs to the checkpoint
 
 It is a Jinja template stored in the GGUF as the named chat template `system_one`, rendered
-with llama.cpp's own Jinja engine, and a model without one is an error rather than a guess --
-different System One lines need different prompts, so there is deliberately no built-in
-default. `--system-one-template-file` is the escape hatch, and a template override usually
-needs `--labels` with it: the labels say *where* an answer is read, so a format that writes
+with llama.cpp's own Jinja engine. There is no built-in default, so a model without one is an
+error. `--system-one-template-file` overrides it, and usually needs `--labels` with it: the labels say *where* an answer is read, so a format that writes
 `(1)(2)(3)` has to say so or the reply is a distribution over `A`, `B`, `C` that nothing wrote.
 
 This is **not** the chat template. A System One template is rendered with a state, questions

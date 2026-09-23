@@ -62,10 +62,6 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     //   a classification head  -> the answer is that head's score, one sequence per option
     //   bidirectional          -> the answer is read at a mask token inside the question
     //   otherwise              -> the answer is the next token after the question
-    // Asked of capabilities, never of the architecture name -- llama_model_cls_label() returns
-    // null unless the model declares classifier labels, and causal attention is a kv every
-    // converter already writes. Verified to reproduce the declared readout on every System One
-    // checkpoint we have.
     {
         std::string arch;
         bool causal = true;
@@ -257,9 +253,8 @@ system_one_tokenized system_one_resolve_question_slots(const llama_vocab * vocab
     const bool masked = cfg.readout == SYSTEM_ONE_READOUT_MASKED_SLOT;
 
     for (size_t i = 0; i < question_segments.size(); i++) {
-        // Special tokens -- BOS, a mask -- are written into the template as text and have to
-        // parse back to their ids. HF's tokenizers split on added and special tokens regardless
-        // of add_special_tokens, so parsing them is what matches the reference.
+        // BOS and the mask are written into the template as text and have to parse back to
+        // their ids, which is also what HF's tokenizers do regardless of add_special_tokens.
         const auto ids = common_tokenize(vocab, question_segments[i], false, true);
         if (ids.empty()) {
             throw std::invalid_argument("question segment " + std::to_string(i) + " tokenized to nothing");
@@ -320,10 +315,8 @@ system_one_tokenized system_one_tokenize_segments(const llama_vocab * vocab,
 std::vector<llama_token> system_one_label_tokens(const llama_vocab * vocab,
                                                  const std::vector<std::string> & labels,
                                                  bool labels_are_default) {
-    // Tokenize each label rather than matching vocab text: a label is read at the position
-    // where the template would have written it, so it has to be what the tokenizer produces
-    // there. This also makes leading spaces work -- a format whose answers are " A", " B"
-    // reads the tokens a BPE vocab spells "ĠA", "ĠB", which no text comparison would find.
+    // Tokenize each label rather than looking it up in the vocab: a format whose answers are
+    // " A", " B" is read at the tokens a BPE vocab spells "ĠA", "ĠB".
     std::vector<llama_token> out(labels.size(), -1);
     for (size_t i = 0; i < labels.size(); i++) {
         const auto ids = common_tokenize(vocab, labels[i], false, false);
@@ -354,9 +347,7 @@ system_one_plan system_one_build_plan(const system_one_params & cfg,
         throw std::invalid_argument("a request needs at least one question");
     }
 
-    // The two sides of a yes/no question are a property of the format, not of the caller:
-    // every front end would otherwise have to know to spell them "no" and "yes". A caller
-    // that wants them worded differently still may -- this only fills in the blank.
+    // noul's two sides belong to the format; a caller may still word them itself
     std::vector<system_one_question> qs;
     qs.reserve(qs_in.size());
     for (auto q : qs_in) {
@@ -414,15 +405,9 @@ void system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params
         seq.tok = system_one_tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments);
     }
 
-    // Reuse is legal exactly where the model is causal: on a bidirectional one the prefix's
-    // representation depends on what follows it, so the same tokens are not the same
-    // computation. Both numbers below stay at zero when it does not hold, so a caller can act
-    // on them without re-deriving the rule.
-    //
-    // How far reuse may go is a separate matter: an answer read from inside the sequence must
-    // not end up inside the reused part, or its slot is never decoded and has no logits. The
-    // state comes before the questions, so a growing transcript still reuses everything up to
-    // where it changed.
+    // Reuse is legal only where the model is causal -- a bidirectional prefix depends on what
+    // follows it -- so both numbers stay at zero otherwise. And it must stop short of any
+    // answer slot, or that slot is never decoded and has no logits.
     for (auto & seq : p.sequences) {
         if (!cfg.causal) continue;
         seq.n_reusable = seq.tok.slots.empty()
@@ -430,9 +415,8 @@ void system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params
             : (size_t) *std::min_element(seq.tok.slots.begin(), seq.tok.slots.end());
     }
 
-    // The option sequences of one question differ only in the option, so they share a long
-    // head -- the state and the question. Measure it rather than assume where it ends: the
-    // template decides where the boundary falls.
+    // The option sequences of one question share a head -- the state and the question. Measure
+    // it rather than assume where it ends: the template decides that.
     for (size_t i = 0; i < p.sequences.size(); i++) {
         auto & seq = p.sequences[i];
         seq.shares_with = i;
@@ -523,7 +507,7 @@ system_one_answer system_one_answer_from_scores(const std::vector<float> & score
     a.probs  = softmax(scores);
     a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
 
-    // confidence = 1 - H(p)/ln K, as the Jev-compatible servers report it
+    // confidence = 1 - H(p)/ln K
     if (scores.size() > 1) {
         double h = 0.0;
         for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
@@ -571,8 +555,6 @@ system_one_context_needs system_one_required_context(const system_one_params & c
     system_one_context_needs need;
 
     if (cfg.readout == SYSTEM_ONE_READOUT_RANK_HEAD) {
-        // the answer is the classification head's output, which is reached as a pooled
-        // embedding -- so the context has to compute embeddings, pooled as a rank score
         need.embeddings   = true;
         need.pooling_type = LLAMA_POOLING_TYPE_RANK;
     }
