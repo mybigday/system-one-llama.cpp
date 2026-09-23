@@ -96,8 +96,16 @@ system_one_params system_one_params_from_model(const llama_model * model) {
         const char * t = id >= 0 ? llama_vocab_get_text(vocab, id) : nullptr;
         return t ? std::string(t) : std::string();
     };
-    out.bos_text = piece(llama_vocab_bos(vocab));
-    out.eos_text = piece(llama_vocab_eos(vocab));
+    // Only what the checkpoint declares. llama_vocab_bos() falls back to a per-family default
+    // when the GGUF carries no id -- 11, a comma, on the BPE path -- and a template asking for
+    // this model's BOS would then write that comma into the prompt.
+    std::string unused;
+    if (meta_str(model, "tokenizer.ggml.bos_token_id", unused)) {
+        out.bos_text = piece(llama_vocab_bos(vocab));
+    }
+    if (meta_str(model, "tokenizer.ggml.eos_token_id", unused)) {
+        out.eos_text = piece(llama_vocab_eos(vocab));
+    }
 
     if (out.readout == SYSTEM_ONE_READOUT_MASKED_SLOT) {
         out.mask_token = llama_vocab_mask(vocab);
