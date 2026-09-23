@@ -5519,8 +5519,8 @@ const json & st = body.at("state");
         std::vector<int> media_slots;
 
         if (!state_files.empty()) {
-            system_one::layout lay;
-            if (!system_one::build_layout(cfg, ctx_server.vocab, state, questions, lay, err)) {
+            system_one::plan lay;
+            if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, lay, err)) {
                 res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
@@ -5582,7 +5582,8 @@ const json & st = body.at("state");
         }
 
         system_one::plan plan;
-        if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, plan, err)) {
+        if (!system_one::build_plan(cfg, ctx_server.vocab, state, questions, plan, err) ||
+            !system_one::tokenize_plan(ctx_server.vocab, cfg, plan, err)) {
             res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

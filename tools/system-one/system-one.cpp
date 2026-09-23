@@ -204,7 +204,7 @@ bool render_segments(const so_config & cfg,
     return true;
 }
 
-bool render_pair_segments(const so_config & cfg,
+static bool render_pair_segments(const so_config & cfg,
                           const std::string & state,
                           const question & q,
                           size_t option_index,
@@ -338,13 +338,13 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
 
 // ---------------------------------------------------------------- planning
 
-bool build_layout(const so_config & cfg,
-                  const llama_vocab * vocab,
-                  const std::string & state,
-                  const std::vector<question> & qs_in,
-                  layout & out,
-                  std::string & err) {
-    out = layout();
+bool build_plan(const so_config & cfg,
+                const llama_vocab * vocab,
+                const std::string & state,
+                const std::vector<question> & qs_in,
+                plan & out,
+                std::string & err) {
+    out = plan();
     if (qs_in.empty()) {
         err = "a request needs at least one question";
         return false;
@@ -376,7 +376,7 @@ bool build_layout(const so_config & cfg,
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
             for (size_t oi = 0; oi < qs[qi].options.size(); oi++) {
-                layout::sequence seq;
+                plan::sequence seq;
                 if (!render_pair_segments(cfg, state, qs[qi], oi, seq.segments, err)) return false;
                 seq.n_question_segments = 0;   // the head scores the sequence, nothing is read at a slot
                 seq.question = qi;
@@ -395,13 +395,13 @@ bool build_layout(const so_config & cfg,
     for (const auto & q : qs) {
         if (q.options.size() > cfg.labels.size()) {
             err = "a question has " + std::to_string(q.options.size()) + " options but this "
-                  "readout has only " + std::to_string(cfg.labels.size()) + " labels; a model "
-                  "with a scoring head (rank_head) has no such limit";
+                "readout has only " + std::to_string(cfg.labels.size()) + " labels; a model "
+                "with a scoring head (rank_head) has no such limit";
             return false;
         }
     }
 
-    layout::sequence seq;
+    plan::sequence seq;
     if (!render_segments(cfg, state, qs, seq.segments, err)) return false;
     seq.n_question_segments = qs.size();
     out.sequences.push_back(std::move(seq));
@@ -409,40 +409,23 @@ bool build_layout(const so_config & cfg,
     return true;
 }
 
-bool build_plan(const so_config & cfg,
-                const llama_vocab * vocab,
-                const std::string & state,
-                const std::vector<question> & qs_in,
-                plan & out,
-                std::string & err) {
-    layout lay;
-    if (!build_layout(cfg, vocab, state, qs_in, lay, err)) return false;
-
-    out = plan();
-    out.n_options    = lay.n_options;
-    out.labels       = lay.labels;
-    out.rank_pooling = lay.rank_pooling;
-
-    for (const auto & ls : lay.sequences) {
-        plan::sequence seq;
-        seq.question = ls.question;
-        seq.option   = ls.option;
-        if (!tokenize_segments(vocab, cfg, ls.segments, ls.n_question_segments, seq.tok, err)) {
+bool tokenize_plan(const llama_vocab * vocab, const so_config & cfg, plan & p, std::string & err) {
+    for (auto & seq : p.sequences) {
+        if (!tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments, seq.tok, err)) {
             return false;
         }
-        out.sequences.push_back(std::move(seq));
     }
 
     // Reuse is legal exactly where the model is causal: on a bidirectional one the prefix's
     // representation depends on what follows it, so the same tokens are not the same
-    // computation. Everything below is therefore zero unless cfg.causal, and a caller can act
-    // on these numbers without re-deriving the rule.
+    // computation. Both numbers below stay at zero when it does not hold, so a caller can act
+    // on them without re-deriving the rule.
     //
     // How far reuse may go is a separate matter: an answer read from inside the sequence must
     // not end up inside the reused part, or its slot is never decoded and has no logits. The
     // state comes before the questions, so a growing transcript still reuses everything up to
     // where it changed.
-    for (auto & seq : out.sequences) {
+    for (auto & seq : p.sequences) {
         if (!cfg.causal) continue;
         seq.n_reusable = seq.tok.slots.empty()
             ? seq.tok.ids.size()
@@ -451,17 +434,17 @@ bool build_plan(const so_config & cfg,
 
     // The option sequences of one question differ only in the option, so they share a long
     // head -- the state and the question. Measure it rather than assume where it ends: the
-    // template decides the layout.
-    for (size_t i = 0; i < out.sequences.size(); i++) {
-        auto & seq = out.sequences[i];
+    // template decides where the boundary falls.
+    for (size_t i = 0; i < p.sequences.size(); i++) {
+        auto & seq = p.sequences[i];
         seq.shares_with = i;
         seq.n_shared    = 0;
         if (!cfg.causal) continue;
 
         for (size_t j = 0; j < i; j++) {
-            if (out.sequences[j].question != seq.question) continue;
+            if (p.sequences[j].question != seq.question) continue;
 
-            const auto & a = out.sequences[j].tok.ids;
+            const auto & a = p.sequences[j].tok.ids;
             const auto & b = seq.tok.ids;
             size_t n = 0;
             while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
@@ -545,7 +528,7 @@ float score_expectation(const answer & a) {
     return (float) e;
 }
 
-context_needs required_context(const so_config & cfg, const plan & p) {
+context_needs required_context(const so_config & cfg) {
     context_needs need;
 
     if (cfg.ranked()) {
@@ -553,15 +536,6 @@ context_needs required_context(const so_config & cfg, const plan & p) {
         // embedding -- so the context has to compute embeddings, pooled as a rank score
         need.embeddings   = true;
         need.pooling_type = LLAMA_POOLING_TYPE_RANK;
-    }
-
-    need.share_prefix = false;
-    for (const auto & seq : p.sequences) {
-        need.share_prefix |= seq.n_shared > 0;
-    }
-    need.n_seq = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
-    for (size_t i = 0; i < need.n_seq; i++) {
-        need.n_tokens += p.sequences[i].tok.ids.size();
     }
 
     return need;

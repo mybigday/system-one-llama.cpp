@@ -33,6 +33,9 @@
 
 using json = nlohmann::ordered_json;
 
+// How many option sequences to put in one decode.
+static constexpr size_t MAX_BATCHED_SEQS = 32;
+
 static void print_usage(int, char ** argv) {
     LOG("\nexample:\n");
     LOG("  %s -m model.gguf --state \"...\" --noul \"ok:Is the order complete?\"\n", argv[0]);
@@ -386,7 +389,8 @@ int main(int argc, char ** argv) {
     }
 
     system_one::plan plan;
-    if (!system_one::build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err)) {
+    if (!system_one::build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
+        !system_one::tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_model_free(model);
         return 1;
@@ -394,7 +398,7 @@ int main(int argc, char ** argv) {
 
     // What the checkpoint's readout needs of the context, applied here rather than by the
     // library, so every value the context is built with is visible at this one place.
-    const system_one::context_needs need = system_one::required_context(cfg, plan);
+    const system_one::context_needs need = system_one::required_context(cfg);
 
     if (need.embeddings) {
         params.embedding = true;
@@ -402,14 +406,25 @@ int main(int argc, char ** argv) {
     if (need.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED) {
         params.pooling_type = need.pooling_type;
     }
-    if (need.share_prefix) {
-        // the sequences share their prefix by copying a range of its KV to the others, and a
-        // partial seq_cp() only works inside one stream -- which is what a unified cache is
-        params.kv_unified = true;
-    }
-    if (need.n_seq > 1) {
-        params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) need.n_seq);
-        params.n_ubatch   = std::max<int32_t>(params.n_ubatch,   (int32_t) need.n_tokens);
+
+    // How big to make the context is this tool's call, not the library's. Scoring one sequence
+    // per option wants them in one decode; this many at a time is enough to matter without a
+    // 255-option question demanding a 255-sequence micro-batch.
+    const size_t n_seq = std::min<size_t>(plan.sequences.size(), MAX_BATCHED_SEQS);
+    if (n_seq > 1) {
+        size_t n_tok = 0;
+        bool   share = false;
+        for (size_t i = 0; i < n_seq; i++) {
+            n_tok += plan.sequences[i].tok.ids.size();
+            share  = share || plan.sequences[i].n_shared > 0;
+        }
+        if (share) {
+            // sharing copies a range of one sequence's KV to the others, and a partial
+            // seq_cp() only works inside one stream -- which is what a unified cache is
+            params.kv_unified = true;
+        }
+        params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) n_seq);
+        params.n_ubatch   = std::max<int32_t>(params.n_ubatch,   (int32_t) n_tok);
         params.n_batch    = std::max<int32_t>(params.n_batch,    params.n_ubatch);
         params.n_ctx      = std::max<int32_t>(params.n_ctx,      params.n_ubatch);
     }

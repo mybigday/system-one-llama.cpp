@@ -77,6 +77,10 @@ struct so_config {
     static bool from_model(const llama_model * model, so_config & out, std::string & err);
 };
 
+// The stages below are exposed so the pipeline can be checked one step at a time against a
+// reference -- the regression harnesses compare the rendered text and the segment-wise ids
+// separately, which build_plan() alone could not tell apart.
+
 // Render the template, then split on the separator. The last `n_questions` segments are
 // the question blocks. `mask` is exposed to the template so a masked-slot format can place
 // its mask token, and the answer slot is then that token rather than the segment's end.
@@ -86,16 +90,6 @@ bool render_segments(const so_config & cfg,
                      std::vector<std::string> & segments,
                      std::string & err);
 
-// A rank_head prompt is built per (question, option) pair rather than once for the whole
-// request: the template sees `state`, `question` and `option` instead of `questions`.
-bool render_pair_segments(const so_config & cfg,
-                          const std::string & state,
-                          const question & q,
-                          size_t option_index,
-                          std::vector<std::string> & segments,
-                          std::string & err);
-
-
 struct tokenized {
     std::vector<llama_token> ids;
     std::vector<int>         slots;   // one per question: position of its "(" token
@@ -104,26 +98,37 @@ struct tokenized {
 // What a request turns into before anything is evaluated: which sequences to run, where the
 // answers are in them, and what the numbers coming back mean. Every decision that depends on
 // the readout is made here, so a caller only has to run sequences and hand the numbers back.
+// A request, resolved. build_plan() fills in everything but the tokens -- which sequences to
+// run, what each renders to, where its answers will be read -- and tokenize_plan() fills in the
+// rest. They are separate because a caller may have to encode part of the input itself: a state
+// carrying images or audio is tokenized by whoever holds the mtmd context, not here.
 struct plan {
     struct sequence {
-        tokenized tok;              // ids, and the answer slots when the readout has any
-        size_t    question = 0;     // rank_head: the question this sequence scores
-        size_t    option   = 0;     // rank_head: the option it scores
+        // stage one: what this sequence renders to. The trailing n_question_segments are the
+        // question blocks; everything before them is the state.
+        std::vector<std::string> segments;
+        size_t n_question_segments = 0;
+
+        size_t question = 0;   // rank_head: the question this sequence scores
+        size_t option   = 0;   // rank_head: the option it scores
+
+        // stage two: what that tokenized to, and where the answers sit in it
+        tokenized tok;
 
         // A prefix's KV may be reused only where the prefix's representation does not depend
-        // on what follows it -- that is, only on a causal model. Both numbers below are already
-        // zero when it does not hold, so a caller never has to ask again.
+        // on what follows it -- that is, only on a causal model. Both numbers are already zero
+        // when it does not hold, so a caller never has to ask again.
 
         // How far a reused prefix may extend into this sequence. Short of the whole sequence
         // when an answer is read from inside it: a slot covered by the reused part is never
         // decoded and has no logits.
-        size_t    n_reusable  = 0;
+        size_t n_reusable  = 0;
 
         // How many leading tokens this sequence has in common with an earlier one of the same
         // question, and which that is -- the state and the question, for a readout that scores
         // one sequence per option. Decode that once and copy its KV rather than repeating it.
-        size_t    shares_with = 0;
-        size_t    n_shared    = 0;
+        size_t shares_with = 0;
+        size_t n_shared    = 0;
     };
 
     std::vector<sequence>    sequences;
@@ -133,41 +138,17 @@ struct plan {
     bool rank_pooling = false;  // sequences are scored by the model's head, not read at a slot
 };
 
-// A noul question with no options declared gets {"no","yes"}: which words the two sides of
-// a yes/no answer are spelled with is a property of the format, not something each front end
-// should have to know. A caller that wants them worded differently still sets them.
-// What a request renders to, before anything is tokenized. The trailing `n_question_segments`
-// of each sequence are the question blocks; everything before them is the state.
-//
-// This exists so a caller can encode the state itself -- with mtmd, when it carries images or
-// audio -- and still get the question slots placed by the same rule as the text-only path.
-// Splitting a request is phase one, turning it into tokens is phase two, and build_plan() is
-// simply the two composed for a caller that has nothing but text.
-struct layout {
-    struct sequence {
-        std::vector<std::string> segments;
-        size_t n_question_segments = 0;
-        size_t question = 0;   // rank_head: the question this sequence scores
-        size_t option   = 0;   // rank_head: the option it scores
-    };
+// Stage one: what the request is, before anything is tokenized.
+bool build_plan(const so_config & cfg,
+                const llama_vocab * vocab,
+                const std::string & state,
+                const std::vector<question> & qs_in,
+                plan & out,
+                std::string & err);
 
-    std::vector<sequence>    sequences;
-    std::vector<int>         n_options;
-    std::vector<llama_token> labels;
-    bool rank_pooling = false;
-};
+// Stage two, for a caller whose input is all text.
+bool tokenize_plan(const llama_vocab * vocab, const so_config & cfg, plan & p, std::string & err);
 
-bool build_layout(const so_config & cfg,
-                  const llama_vocab * vocab,
-                  const std::string & state,
-                  const std::vector<question> & qs_in,
-                  layout & out,
-                  std::string & err);
-
-// Place the answer slots of the question segments, given how many positions the state already
-// occupies. The state may be anything -- plain text, or text with media chunks the caller
-// encoded itself -- because a question segment is always text, and the slot rule only needs to
-// know where the question blocks begin.
 bool resolve_question_slots(const llama_vocab * vocab,
                             const so_config & cfg,
                             const std::vector<std::string> & question_segments,
@@ -176,12 +157,6 @@ bool resolve_question_slots(const llama_vocab * vocab,
                             std::vector<int> & slots_out,
                             std::string & err);
 
-bool build_plan(const so_config & cfg,
-                const llama_vocab * vocab,
-                const std::string & state,
-                const std::vector<question> & qs_in,
-                plan & out,
-                std::string & err);
 
 // One BOS (when the model asks for it), then every segment with add_special = false.
 bool tokenize_segments(const llama_vocab * vocab,
@@ -220,22 +195,14 @@ answer answer_from_scores(const std::vector<float> & scores);
 bool answers_from_scores(const plan & p, const std::vector<float> & scores,
                          std::vector<answer> & out, std::string & err);
 
-// What a request needs of the context that will run it. This only reports; applying it is the
-// caller's, so nothing it owns changes behind its back and it stays free to refuse, to clamp,
-// or to keep a value the user asked for.
+// What the readout requires of a context -- not how big to make it, which is the caller's
+// business, but the part the checkpoint dictates: a rank_head answer is a classification
+// head's output, which is reached as a pooled embedding.
 struct context_needs {
-    bool               embeddings   = false;                          // rank_head answers through the head
-    enum llama_pooling_type pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED; // ... pooled as a rank score
-    bool               share_prefix = false; // some sequences will share a prefix's KV, which a
-                                             // partial seq_cp() can only do within one stream
-    size_t             n_seq        = 1;  // sequences that would go into one decode
-    size_t             n_tokens     = 0;  // ... and how many tokens that is
+    bool                    embeddings   = false;
+    enum llama_pooling_type pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 };
 
-// Capped, because a 255-option question should not demand a 255-sequence micro-batch.
-// The caller then fits whatever context it actually created.
-constexpr size_t MAX_BATCHED_SEQS = 32;
-
-context_needs required_context(const so_config & cfg, const plan & p);
+context_needs required_context(const so_config & cfg);
 
 } // namespace system_one
