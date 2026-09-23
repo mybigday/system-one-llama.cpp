@@ -1041,16 +1041,9 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
 // graph builders. Only gated activations that map cleanly to llm_ffn_op_type are
 // listed; unrecognized values fall back to GeGLU, which matches the historical
 // default for ModernBert-style architectures.
-// These are the names a model states its activation with, i.e. transformers' spelling, since
-// that is what the converter copies into {arch}.hidden_activation. In transformers "gelu" is
-// the exact erf one (ACT2FN["gelu"] is GELUActivation) and the tanh approximation is a
-// separate name -- not a faster stand-in for the same function, but a different activation
-// that models like Gemma are genuinely trained with. ggml has both, so the names have to line
-// up or a model silently runs the one it was not trained with.
 static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING = {
-    { "gelu",              LLM_FFN_GEGLU_ERF },
-    { "gelu_pytorch_tanh", LLM_FFN_GEGLU     },
-    { "geglu",             LLM_FFN_GEGLU     },
+    { "gelu",   LLM_FFN_GEGLU  },
+    { "geglu",  LLM_FFN_GEGLU  },
     { "silu",   LLM_FFN_SWIGLU },
     { "swish",  LLM_FFN_SWIGLU },
     { "swiglu", LLM_FFN_SWIGLU },

@@ -14,10 +14,10 @@ void llama_model_modern_bert::load_arch_hparams(llama_model_loader & ml) {
 
     // Some ModernBert derivatives (e.g. IBM Granite Embedding 97m R2) use
     // SiLU/SwiGLU in the FFN instead of the default GELU/GeGLU.
-    hparams.llm_ffn_op = LLM_FFN_GEGLU_ERF;
+    hparams.llm_ffn_op = LLM_FFN_GEGLU;
     std::string hidden_act;
     if (ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false)) {
-        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_GEGLU_ERF);
+        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_GEGLU);
     }
 
     switch (hparams.n_layer()) {
@@ -178,10 +178,7 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
     // so this is only built when the checkpoint actually carries one.
     if (model.output_b) {
         cur = build_lora_mm(model.cls, cur);
-        // ModernBertPredictionHead uses config.classifier_activation, which is "gelu" --
-        // and HF's "gelu" is the exact erf one (ACT2FN maps the tanh approximation to
-        // "gelu_pytorch_tanh" instead), so this must not be ggml_gelu()
-        cur = ggml_gelu_erf(ctx0, cur);
+        cur = ggml_gelu(ctx0, cur);
         cur = build_norm(cur, model.cls_norm, NULL, LLM_NORM, -1);
         cb(cur, "mlm_head_norm", -1);
 
