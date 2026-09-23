@@ -5362,8 +5362,8 @@ void server_routes::init_routes() {
     //
     // {"model": "...", "state": <string|object>, "questions": {
     //     "<key>": {"type": "noul"|"choice"|"score", "instructions": "...",
-    //               "criteria": {...}|[...], "temperature": 1.0}},
-    //  "template": "<optional Jinja override>"}
+    //               "criteria": {...}|[...]}},
+    //  "temperature": 1.0, "template": "<optional Jinja override>"}
     //
     // This handler owns the wire format and the task plumbing, and nothing else: which
     // sequences a request becomes, where its answers sit and what the numbers mean are the
@@ -5468,14 +5468,23 @@ const json & st = body.at("state");
         std::vector<std::string>              keys;
         std::vector<std::string>              kinds;
         std::vector<std::vector<std::string>> options;
-        std::vector<float>                    temperatures;
         std::vector<system_one::question>     questions;
+
+        // one temperature for the request, because calibration is a property of the
+        // deployment rather than of a question: a caller fits it on its own distribution
+        const float temperature = json_value(body, "temperature", 1.0f);
 
         for (const auto & item : body.at("questions").items()) {
             const std::string & key = item.key();
             const json &        q   = item.value();
             if (!q.is_object()) {
                 res->error(format_error_response("question \"" + key + "\" must be an object", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            if (q.contains("temperature")) {
+                // it used to live here; saying so beats quietly returning uncalibrated numbers
+                res->error(format_error_response("question \"" + key + "\": \"temperature\" is one value for the whole request, not per question -- move it to the top level", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
 
@@ -5519,7 +5528,6 @@ const json & st = body.at("state");
             keys.push_back(key);
             kinds.push_back(type);
             options.push_back(out.options);
-            temperatures.push_back(json_value(q, "temperature", 1.0f));
             questions.push_back(std::move(out));
         }
 
@@ -5697,9 +5705,9 @@ const json & st = body.at("state");
         for (size_t qi = 0; qi < keys.size(); qi++) {
             auto a = answers[qi];
 
-            // an optional per-question temperature, for callers recalibrating on their own
-            // distribution; the model ships with its own T already folded into the weights
-            system_one::apply_temperature(a, temperatures[qi]);
+            // the model ships with its own T already folded into the weights, so this only
+            // moves when the caller has recalibrated on a distribution of its own
+            system_one::apply_temperature(a, temperature);
 
             json one = json::object();
             if (kinds[qi] == "noul") {

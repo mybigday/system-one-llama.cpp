@@ -4503,8 +4503,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--system-one-temperature"}, "T",
         "rescale every answer's logits by T before the probabilities are taken (default: 1,\n"
-        "which is skipped entirely). The checkpoint's own calibration is already in its\n"
-        "weights; this is for recalibrating on a distribution of your own.\n"
+        "which is skipped entirely; overrides a \"temperature\" in the request body). The\n"
+        "checkpoint's own calibration is already in its weights; this is for recalibrating\n"
+        "on a distribution of your own.\n"
         "not --temp, which is the sampling temperature and means nothing here: nothing is\n"
         "sampled and no token is generated",
         [](common_params & params, const std::string & value) {
