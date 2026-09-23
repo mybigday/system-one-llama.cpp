@@ -89,6 +89,8 @@ static bool collect_questions(const common_params & params,
                               std::vector<std::string> & keys,
                               std::vector<system_one::question> & qs,
                               std::string & state,
+                              std::vector<std::string> & cfg_labels,
+                              std::vector<float> & temps,
                               std::string & err) {
     if (!params.so_request_file.empty()) {
         std::string body;
@@ -99,6 +101,14 @@ static bool collect_questions(const common_params & params,
         } catch (const std::exception & e) {
             err = std::string("invalid request JSON: ") + e.what();
             return false;
+        }
+        if (req.contains("labels")) {
+            try {
+                cfg_labels = req.at("labels").get<std::vector<std::string>>();
+            } catch (const std::exception &) {
+                err = "\"labels\" must be an array of strings";
+                return false;
+            }
         }
         if (req.contains("state")) {
             const json & st = req.at("state");
@@ -142,6 +152,7 @@ static bool collect_questions(const common_params & params,
                 return false;
             }
             keys.push_back(item.key());
+            temps.push_back(q.value("temperature", 1.0f));
             qs.push_back(std::move(out));
         }
         return true;
@@ -154,6 +165,7 @@ static bool collect_questions(const common_params & params,
         q.k = system_one::kind::noul;
         q.text = instr;
         keys.push_back(key);
+        temps.push_back(1.0f);
         qs.push_back(std::move(q));
     }
     for (const auto & spec : params.so_choice) {
@@ -167,6 +179,7 @@ static bool collect_questions(const common_params & params,
         q.text = instr;
         parse_options(rest, true, q.options, q.descs);
         keys.push_back(key);
+        temps.push_back(1.0f);
         qs.push_back(std::move(q));
     }
     for (const auto & spec : params.so_score) {
@@ -180,6 +193,7 @@ static bool collect_questions(const common_params & params,
         q.text = instr;
         parse_options(rest, false, q.options, q.descs);
         keys.push_back(key);
+        temps.push_back(1.0f);
         qs.push_back(std::move(q));
     }
     return true;
@@ -377,7 +391,9 @@ int main(int argc, char ** argv) {
 
     std::vector<std::string>           keys;
     std::vector<system_one::question>  qs;
-    if (!collect_questions(params, keys, qs, state, err)) {
+    std::vector<std::string> req_labels;
+    std::vector<float>       temps;
+    if (!collect_questions(params, keys, qs, state, req_labels, temps, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_model_free(model);
         return 1;
@@ -389,6 +405,16 @@ int main(int argc, char ** argv) {
     }
 
     system_one::plan plan;
+    if (!params.so_labels.empty()) {
+        req_labels = string_split<std::string>(params.so_labels, ',');
+    }
+    if (!req_labels.empty()) {
+        // the labels say where an answer is read, so a format written by an overridden
+        // template has to be able to name them too
+        cfg.labels             = req_labels;
+        cfg.labels_are_default = false;
+    }
+
     if (!system_one::build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
         !system_one::tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
@@ -444,6 +470,13 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_free(ctx); llama_model_free(model);
         return 1;
+    }
+
+    // A caller recalibrating on its own distribution can scale each answer; T = 1, the common
+    // case, costs nothing. The model's own T is already folded into its weights.
+    for (size_t qi = 0; qi < answers.size() && qi < temps.size(); qi++) {
+        const float t = params.so_temperature > 0.0f ? params.so_temperature : temps[qi];
+        system_one::apply_temperature(answers[qi], t);
     }
 
     // One rendering loop for every readout: the answers arrived in request order either way.

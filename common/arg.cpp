@@ -4492,6 +4492,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SYSTEM_ONE}));
     add_opt(common_arg(
+        {"--labels"}, "A,B,C",
+        "the labels an answer is read at, overriding the checkpoint's (default: A-Za-z).\n"
+        "a template override usually needs this too: the labels say where the answer is read,\n"
+        "so a format that writes (1)(2)(3) has to say so or it is read at A, B, C instead",
+        [](common_params & params, const std::string & value) {
+            params.so_labels = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SYSTEM_ONE}));
+    add_opt(common_arg(
+        {"--system-one-temperature"}, "T",
+        "rescale every answer's logits by T before the probabilities are taken (default: 1,\n"
+        "which is skipped entirely). The checkpoint's own calibration is already in its\n"
+        "weights; this is for recalibrating on a distribution of your own.\n"
+        "not --temp, which is the sampling temperature and means nothing here: nothing is\n"
+        "sampled and no token is generated",
+        [](common_params & params, const std::string & value) {
+            params.so_temperature = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SYSTEM_ONE}));
+    add_opt(common_arg(
         {"--json"},
         "print the answers as the JSON the /v1/systemone route returns",
         [](common_params & params) {

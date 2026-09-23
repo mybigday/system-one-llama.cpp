@@ -57,8 +57,11 @@ struct so_config {
     //                the reranker shape, and the only readout that costs K forward passes
     std::string readout = "letter_slot";
 
-    // system_one.labels: option i is labelled labels[i] and that token is what gets read
+    // system_one.labels: option i is labelled labels[i] and that token is what gets read.
+    // Defaulted to A-Za-z when the checkpoint says nothing, which is why a failure to resolve
+    // one has to say where the label came from -- the caller may never have chosen it.
     std::vector<std::string> labels;
+    bool labels_are_default = false;
 
     // from the standard metadata
     // {arch}.attention.causal, and what the readout is derived from. It is also the whole of
@@ -170,7 +173,7 @@ bool tokenize_segments(const llama_vocab * vocab,
 // Token ids of the label pieces, in `labels` order. Every label must be a single token, since
 // the answer is read as one position's distribution over them.
 bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
-                  std::vector<llama_token> & out);
+                  std::vector<llama_token> & out, std::string * bad = nullptr);
 
 struct answer {
     int                choice = 0;      // argmax over the labels
@@ -183,6 +186,12 @@ struct answer {
 // tokens, softmax over just those, argmax, and the entropy-normalised confidence.
 // Shared by the standalone tools and the server route so the math has one home.
 answer answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options);
+
+// Rescale an answer by a temperature and recompute everything that follows from it. The model
+// ships with its own T already folded into its weights, so this is for a caller recalibrating
+// on a distribution of its own; T = 1 is the common case and costs nothing, which is why it is
+// checked rather than applied.
+void apply_temperature(answer & a, float t);
 
 // Expected value over an ordered rubric: sum(i * p_i), the `score` question type.
 float score_expectation(const answer & a);

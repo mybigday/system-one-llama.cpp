@@ -76,6 +76,7 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
 
     if (out.labels.empty()) {
         // the usual alphabet, so a plain letter format needs no key at all
+        out.labels_are_default = true;
         for (char c = 'A'; c <= 'Z'; c++) out.labels.push_back(std::string(1, c));
         for (char c = 'a'; c <= 'z'; c++) out.labels.push_back(std::string(1, c));
     }
@@ -323,7 +324,7 @@ bool tokenize_segments(const llama_vocab * vocab,
 }
 
 bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
-                  std::vector<llama_token> & out) {
+                  std::vector<llama_token> & out, std::string * bad) {
     // Tokenize each label rather than matching vocab text: a label is read at the position
     // where the template would have written it, so it has to be what the tokenizer produces
     // there. This also makes leading spaces work -- a format whose answers are " A", " B"
@@ -331,7 +332,11 @@ bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & la
     out.assign(labels.size(), -1);
     for (size_t i = 0; i < labels.size(); i++) {
         const auto ids = common_tokenize(vocab, labels[i], false, false);
-        if (ids.size() == 1) out[i] = ids[0];
+        if (ids.size() == 1) {
+            out[i] = ids[0];
+        } else if (bad != nullptr && bad->empty()) {
+            *bad = labels[i];
+        }
     }
     return std::find(out.begin(), out.end(), -1) == out.end();
 }
@@ -388,8 +393,14 @@ bool build_plan(const so_config & cfg,
     }
 
     // a slot readout answers every question from one sequence
-    if (!label_tokens(vocab, cfg.labels, out.labels)) {
-        err = "a label in system_one.labels is not a single token for this tokenizer";
+    std::string bad;
+    if (!label_tokens(vocab, cfg.labels, out.labels, &bad)) {
+        err = "the answer label \"" + bad + "\" is not a single token for this tokenizer; "
+              + (cfg.labels_are_default
+                 ? "it comes from the default A-Za-z alphabet, not from anything this request "
+                   "or checkpoint asked for -- set system_one.labels, or send \"labels\", to "
+                   "name the labels this format actually writes"
+                 : "it was named by system_one.labels or by the request");
         return false;
     }
     for (const auto & q : qs) {
@@ -520,6 +531,26 @@ answer answer_from_logits(const float * row, const std::vector<llama_token> & le
     std::vector<float> scores(n_options);
     for (int j = 0; j < n_options; j++) scores[j] = row[letter_ids[j]];
     return answer_from_scores(scores);
+}
+
+void apply_temperature(answer & a, float t) {
+    if (t <= 0.0f || std::fabs(t - 1.0f) <= 1e-6f || a.logits.empty()) {
+        return;
+    }
+
+    std::vector<float> scaled(a.logits.size());
+    for (size_t i = 0; i < scaled.size(); i++) scaled[i] = a.logits[i] / t;
+
+    a.probs  = softmax(scaled);
+    a.choice = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
+
+    if (a.probs.size() > 1) {
+        double h = 0.0;
+        for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
+        a.confidence = (float) (1.0 - h / std::log((double) a.probs.size()));
+    } else {
+        a.confidence = 1.0f;
+    }
 }
 
 float score_expectation(const answer & a) {

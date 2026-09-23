@@ -776,6 +776,8 @@ struct common_params {
     std::string so_state_file     = "";  // ... or the file holding it
     std::string so_request_file   = "";  // a /v1/systemone JSON body, instead of the flags below
     std::string so_template_file  = "";  // override the System One template in the checkpoint
+    std::string so_labels         = "";  // ... and the labels its answers are read at
+    float       so_temperature    = 0.0f; // rescale every answer; 0 = use the per-question value
     bool        so_json           = false;  // --json
     std::vector<std::string> so_noul;    // KEY:INSTRUCTIONS
     std::vector<std::string> so_choice;  // KEY:INSTRUCTIONS:opt[=desc][,opt[=desc]...]

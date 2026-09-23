@@ -5388,6 +5388,23 @@ void server_routes::init_routes() {
             cfg.template_src = body.at("template").get<std::string>();
         }
 
+        // A template override without its labels would be answered at the wrong tokens: the
+        // labels say where the answer is read, so a format that writes (1)(2)(3) has to say so
+        // or the reply is a distribution over A, B, C that nothing wrote.
+        if (body.contains("labels")) {
+            if (!body.at("labels").is_array() || body.at("labels").empty()) {
+                res->error(format_error_response("\"labels\" must be a non-empty array of strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            try {
+                cfg.labels = body.at("labels").get<std::vector<std::string>>();
+            } catch (const std::exception &) {
+                res->error(format_error_response("\"labels\" must be an array of strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            cfg.labels_are_default = false;
+        }
+
         if (!body.contains("questions") || !body.at("questions").is_object()) {
             res->error(format_error_response("\"questions\" must be an object", ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -5682,20 +5699,7 @@ const json & st = body.at("state");
 
             // an optional per-question temperature, for callers recalibrating on their own
             // distribution; the model ships with its own T already folded into the weights
-            const float t = temperatures[qi];
-            if (t > 0.0f && std::fabs(t - 1.0f) > 1e-6f && !a.logits.empty()) {
-                std::vector<float> scaled(a.logits.size());
-                for (size_t j = 0; j < scaled.size(); j++) scaled[j] = a.logits[j] / t;
-                const float mx = *std::max_element(scaled.begin(), scaled.end());
-                float sum = 0.0f;
-                for (auto & v : scaled) { v = std::exp(v - mx); sum += v; }
-                for (size_t j = 0; j < scaled.size(); j++) a.probs[j] = scaled[j] / sum;
-
-                double h = 0.0;
-                for (float p : a.probs) if (p > 0.0f) h -= (double) p * std::log((double) p);
-                a.confidence = a.probs.size() > 1 ? (float) (1.0 - h / std::log((double) a.probs.size())) : 1.0f;
-                a.choice     = (int) (std::max_element(a.probs.begin(), a.probs.end()) - a.probs.begin());
-            }
+            system_one::apply_temperature(a, temperatures[qi]);
 
             json one = json::object();
             if (kinds[qi] == "noul") {
