@@ -277,12 +277,6 @@ void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-bool llm_pooling_reads_last_token(enum llama_pooling_type pooling_type, llm_arch arch) {
-    return pooling_type == LLAMA_POOLING_TYPE_LAST ||
-           // qwen3 reranking & embedding models use last token
-           (pooling_type == LLAMA_POOLING_TYPE_RANK && (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL));
-}
-
 void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens     = ubatch->n_tokens;
     const int64_t n_seqs_unq   = ubatch->n_seqs_unq;
@@ -301,7 +295,10 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
         std::vector<int> target_pos(n_seqs_unq, -1);
         std::vector<int> target_row(n_seqs_unq, -1);
 
-        const bool last = llm_pooling_reads_last_token(cparams.pooling_type, arch);
+        const bool last = (
+             cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ||
+            (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_QWEN3VL)) // qwen3 reranking & embedding models use last token
+        );
 
         for (int i = 0; i < n_tokens; ++i) {
             const llama_pos pos = ubatch->pos[i];
