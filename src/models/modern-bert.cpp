@@ -63,6 +63,10 @@ void llama_model_modern_bert::load_arch_tensors(llama_model_loader &) {
     cls       = create_tensor(tn(LLM_TENSOR_CLS,      "weight"), {n_embd, n_embd},            TENSOR_NOT_REQUIRED);
     cls_norm  = create_tensor(tn(LLM_TENSOR_CLS_NORM, "weight"), {n_embd},                    TENSOR_NOT_REQUIRED);
 
+    // ModernBertForMaskedLM shares that head (dense + norm) with the classifier and then
+    // projects with the token embeddings, which are tied -- so only the bias is a tensor of
+    // its own, and its presence is what says this checkpoint has a masked-LM head at all.
+    output_b  = create_tensor(tn(LLM_TENSOR_OUTPUT,   "bias"),   {n_vocab},                   TENSOR_NOT_REQUIRED);
 
 }
 
@@ -169,6 +173,24 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
     cb(cur, "final_norm_out", -1);
 
     res->t_embd = cur;
+
+    // masked-LM head. The distribution at a mask token is what a masked_slot readout reads,
+    // so this is only built when the checkpoint actually carries one.
+    if (model.output_b) {
+        cur = build_lora_mm(model.cls, cur);
+        // ModernBertPredictionHead uses config.classifier_activation, which is "gelu" --
+        // and HF's "gelu" is the exact erf one (ACT2FN maps the tanh approximation to
+        // "gelu_pytorch_tanh" instead), so this must not be ggml_gelu()
+        cur = ggml_gelu_erf(ctx0, cur);
+        cur = build_norm(cur, model.cls_norm, NULL, LLM_NORM, -1);
+        cb(cur, "mlm_head_norm", -1);
+
+        // the decoder is tied to the input embeddings
+        cur = build_lora_mm(model.tok_embd, cur);
+        cur = ggml_add(ctx0, cur, model.output_b);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

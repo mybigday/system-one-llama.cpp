@@ -86,6 +86,8 @@ class TensorNameMap:
             "model.lm_head",             # dflash
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
+            "decoder",                   # modern-bert (ModernBertForMaskedLM); tied to the
+                                         # embeddings, so in practice only its bias is stored
         ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
