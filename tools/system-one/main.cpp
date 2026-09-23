@@ -539,7 +539,10 @@ int main(int argc, char ** argv) {
                     }
                     break;
                 case SYSTEM_ONE_KIND_SCORE:
-                    LOG("  score = %.4f over %zu levels\n", system_one_score_expectation(a), q.options.size());
+                    // the axis, not a fraction: the index of a level, 0 .. n-1
+                    LOG("  score = %.4f on 0..%zu  (0 %s .. %zu %s)\n",
+                        system_one_score_expectation(a), q.options.size() - 1,
+                        q.options.front().c_str(), q.options.size() - 1, q.options.back().c_str());
                     for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
                         LOG("     %-24s %.4f\n", q.options[i].c_str(), a.probs[i]);
                     }

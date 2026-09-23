@@ -16,14 +16,15 @@ answers, and `llama-system-one`, a CLI over it.
 | `choice` | a distribution over declared options | routing, classification, intent |
 | `score` | a distribution over ordered levels, plus its index-weighted mean | severity, satisfaction, priority |
 
-A `score` answer carries both because neither is enough on its own. The number is
-`Σ i·pᵢ` over the levels' **0-based indices**, so it runs from `0` to `n_levels − 1` -- with
-the four levels below, `0` is `routine` and `3` is `critical`, and the 1.87 in the run is
-"between soon and urgent, nearer urgent". That is the thing to threshold, but it cannot tell a
-confident level from a flat spread: 1.5 is both "certainly halfway" and "no idea". The
-distribution says which, and it is what makes the mean meaningful at all -- the levels have to
-be evenly spaced for an average of their indices to mean anything, which is an assumption the
-caller makes when it chooses them.
+A `score` is **a position on the level axis, not a fraction of anything**: `Σ i·pᵢ` over the
+levels' 0-based indices, so it runs `0 .. n_levels − 1`. With the four levels in the run below
+that axis is `0 routine, 1 soon, 2 urgent, 3 critical`, and 1.87 sits between `soon` and
+`urgent`, close to `urgent` -- it is not 1.87 out of 4.
+
+It comes with the distribution because neither is enough alone. The number is what you
+threshold, but it cannot tell a confident level from a flat spread: 1.5 is both "certainly
+halfway" and "no idea". The distribution says which. And the number only means anything if the
+levels are evenly spaced, which is an assumption the caller makes when it picks them.
 
 Every answer also carries `confidence = 1 − H(p)/ln K` and its raw logits, because calibration
 is the product: a consumer that only takes the argmax could have used anything.
@@ -49,7 +50,7 @@ queue  (choice, confidence 0.910)
      account                  0.0046
 
 urgency  (score, confidence 0.369)
-  score = 1.8675 over 4 levels
+  score = 1.8675 on 0..3  (0 routine .. 3 critical)
      routine                  0.0802
      soon                     0.0803
      urgent                   0.7312
