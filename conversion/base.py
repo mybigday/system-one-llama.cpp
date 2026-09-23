@@ -1531,14 +1531,18 @@ class TextModel(ModelBase):
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
 
-        # Tokens at or beyond vocab_size have no embedding row, so the model can neither
-        # emit nor embed them, and the loop below already ignores them. Some checkpoints
-        # carry one anyway -- e.g. the multimodal <image_soft_token> at id 262144 riding
-        # along in a text-only gemma-3-270m tokenizer -- so warn and drop, don't refuse.
-        oversize = {tok: i for tok, i in tokenizer.vocab.items() if i >= vocab_size}  # ty: ignore[unresolved-attribute]
-        if oversize:
-            logger.warning(f"ignoring {len(oversize)} token(s) at or beyond vocab_size {vocab_size}: "
-                           f"{sorted(oversize.items(), key=lambda kv: kv[1])[:8]}")
+        # `tokenizer.vocab` merges the base vocabulary with the added tokens, so assert on the
+        # base alone: a base-vocab id past vocab_size means the two disagree about the model,
+        # which is an error. An added token past it is a different thing -- a marker the
+        # tokenizer carries for a model this checkpoint is not, e.g. <image_soft_token> in a
+        # text-only gemma-3-270m -- and has no embedding row to be emitted from either way.
+        added = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
+        base = {tok: i for tok, i in tokenizer.vocab.items() if tok not in added}  # ty: ignore[unresolved-attribute]
+        assert max(base.values()) < vocab_size
+        beyond = {tok: i for tok, i in added.items() if i >= vocab_size}
+        if beyond:
+            logger.warning(f"dropping {len(beyond)} added token(s) past vocab_size {vocab_size}, "
+                           f"which have no embedding row: {sorted(beyond.items(), key=lambda kv: kv[1])}")
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
@@ -1939,14 +1943,18 @@ class TextModel(ModelBase):
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
 
-        # Tokens at or beyond vocab_size have no embedding row, so the model can neither
-        # emit nor embed them, and the loop below already ignores them. Some checkpoints
-        # carry one anyway -- e.g. the multimodal <image_soft_token> at id 262144 riding
-        # along in a text-only gemma-3-270m tokenizer -- so warn and drop, don't refuse.
-        oversize = {tok: i for tok, i in tokenizer.vocab.items() if i >= vocab_size}  # ty: ignore[unresolved-attribute]
-        if oversize:
-            logger.warning(f"ignoring {len(oversize)} token(s) at or beyond vocab_size {vocab_size}: "
-                           f"{sorted(oversize.items(), key=lambda kv: kv[1])[:8]}")
+        # `tokenizer.vocab` merges the base vocabulary with the added tokens, so assert on the
+        # base alone: a base-vocab id past vocab_size means the two disagree about the model,
+        # which is an error. An added token past it is a different thing -- a marker the
+        # tokenizer carries for a model this checkpoint is not, e.g. <image_soft_token> in a
+        # text-only gemma-3-270m -- and has no embedding row to be emitted from either way.
+        added = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
+        base = {tok: i for tok, i in tokenizer.vocab.items() if tok not in added}  # ty: ignore[unresolved-attribute]
+        assert max(base.values()) < vocab_size
+        beyond = {tok: i for tok, i in added.items() if i >= vocab_size}
+        if beyond:
+            logger.warning(f"dropping {len(beyond)} added token(s) past vocab_size {vocab_size}, "
+                           f"which have no embedding row: {sorted(beyond.items(), key=lambda kv: kv[1])}")
 
         reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
         # k-mers can share text with a base-vocab BPE token (e.g. CCCCCC) and get
