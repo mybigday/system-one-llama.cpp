@@ -585,6 +585,13 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
+    // Whether this context's pooled output is built from the last token of a sequence alone.
+    // When it is, a sequence may be spread over several batches: the position the pooling reads
+    // is always in the final one. Any other pooling (MEAN over the sequence, CLS at its start)
+    // needs positions that an earlier batch would have left behind, so the whole sequence has
+    // to be evaluated at once.
+    LLAMA_API bool llama_pooling_reads_last_token(const struct llama_context * ctx);
+
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 

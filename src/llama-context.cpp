@@ -3898,6 +3898,10 @@ const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
 
+bool llama_pooling_reads_last_token(const llama_context * ctx) {
+    return llm_pooling_reads_last_token(ctx->pooling_type(), ctx->get_model().arch);
+}
+
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
 }

@@ -246,6 +246,10 @@ public:
     const llama_cparams cparams;
 };
 
+// Does the pooled output only need the last token of a sequence? Decides whether a sequence
+// may be spread over several batches -- see llama_pooling_reads_last_token().
+bool llm_pooling_reads_last_token(enum llama_pooling_type pooling_type, llm_arch arch);
+
 class llm_graph_input_cls : public llm_graph_input_i {
 public:
     llm_graph_input_cls(const llama_cparams & cparams, const llm_arch arch) : cparams(cparams), arch(arch) {}

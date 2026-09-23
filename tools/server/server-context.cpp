@@ -466,9 +466,13 @@ struct server_slot {
     bool can_split() const {
         GGML_ASSERT(task);
 
+        // A pooled output is built from the tokens in the batch, so a sequence may only be
+        // spread over several batches when the pooling reads nothing but its last token --
+        // which is always in the final one. pooling_type == LAST is the obvious case but not
+        // the only one, and asking the library keeps the architecture knowledge out of here.
         return
             !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+            (llama_get_memory(ctx_tgt) && llama_pooling_reads_last_token(ctx_tgt));
     }
 
     bool can_batch_with(server_slot & other_slot) const {
