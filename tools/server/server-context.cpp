@@ -5376,14 +5376,18 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         const bool has_tmpl_override = body.contains("template") && body.at("template").is_string();
 
+        // The only failure this route handles itself: a model with no System One metadata can
+        // still be asked, if the request brings the whole format with it. Everything below
+        // throws, and `ex_wrapper` turns invalid_argument into a 400 and the rest into a 500,
+        // both carrying what() -- so there is nothing left for this route to add.
         system_one_params cfg;
-        std::string err;
-        if (!system_one_params_from_model(ctx_server.model_tgt, cfg, err)) {
+        try {
+            cfg = system_one_params_from_model(ctx_server.model_tgt);
+        } catch (const std::exception & e) {
             if (!has_tmpl_override) {
-                res->error(format_error_response(err, ERROR_TYPE_NOT_SUPPORTED));
+                res->error(format_error_response(e.what(), ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            cfg = system_one_params();
         }
         if (has_tmpl_override) {
             cfg.template_src = body.at("template").get<std::string>();
@@ -5545,11 +5549,7 @@ const json & st = body.at("state");
         std::vector<int> media_slots;
 
         if (!state_files.empty()) {
-            system_one_plan lay;
-            if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, lay, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
+            const system_one_plan lay = system_one_build_plan(cfg, ctx_server.vocab, state, questions);
             if (lay.rank_pooling) {
                 res->error(format_error_response(
                     "media in \"state\" is not supported for a classification-head model: each option "
@@ -5598,21 +5598,14 @@ const json & st = body.at("state");
             }
 
             const std::vector<std::string> q_segments(ls.segments.begin() + first_question, ls.segments.end());
-            std::vector<llama_token> q_ids;
-            if (!system_one_resolve_question_slots(ctx_server.vocab, cfg, q_segments,
-                                                    media_tokens.size(), q_ids, media_slots, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            media_tokens.insert(q_ids);
+            const system_one_tokenized q = system_one_resolve_question_slots(ctx_server.vocab, cfg,
+                                                                            q_segments, media_tokens.size());
+            media_slots = q.slots;
+            media_tokens.insert(q.ids);
         }
 
-        system_one_plan plan;
-        if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, plan, err) ||
-            !system_one_tokenize_plan(ctx_server.vocab, cfg, plan, err)) {
-            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
+        system_one_plan plan = system_one_build_plan(cfg, ctx_server.vocab, state, questions);
+        system_one_tokenize_plan(ctx_server.vocab, cfg, plan);
 
         std::vector<system_one_answer> answers;
         int32_t n_tokens_in = 0;
@@ -5656,10 +5649,7 @@ const json & st = body.at("state");
                 }
             }
 
-            if (!system_one_answers_from_scores(plan, scores, answers, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_SERVER));
-                return res;
-            }
+            answers = system_one_answers_from_scores(plan, scores);
         } else {
             // One sequence, one decode, the answers read at the slots the plan marked.
             const auto & seq = plan.sequences.front();

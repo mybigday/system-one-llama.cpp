@@ -25,6 +25,13 @@
 #include <string>
 #include <vector>
 
+// Errors are exceptions, the way common/chat.h reports them: these calls return what they
+// produce and throw std::invalid_argument when the request or the template as stated cannot be
+// answered, std::runtime_error when the checkpoint cannot or the numbers handed back do not fit
+// the plan. That split is not decoration -- llama-server wraps every route in `ex_wrapper`,
+// which turns invalid_argument into a 400 and anything else into a 500, both carrying what(),
+// so a route needs no error handling of its own to answer a malformed request correctly.
+//
 // This header builds the input and reads the output. Running the model is deliberately not
 // here: like common/chat.h, which renders a prompt and parses a reply but never calls
 // llama_decode, this is the format layer, and inference belongs to whoever owns the batching
@@ -94,9 +101,7 @@ struct system_one_params {
 };
 
 // Reads the metadata. Fails when the model carries no System One template.
-bool system_one_params_from_model(const llama_model * model,
-                                  system_one_params & out,
-                                  std::string & err);
+system_one_params system_one_params_from_model(const llama_model * model);
 
 // The stages below are exposed so the pipeline can be checked one step at a time against a
 // reference -- the regression harnesses compare the rendered text and the segment-wise ids
@@ -105,11 +110,9 @@ bool system_one_params_from_model(const llama_model * model,
 // Render the template, then split on the separator. The last `n_questions` segments are
 // the question blocks. `mask` is exposed to the template so a masked-slot format can place
 // its mask token, and the answer slot is then that token rather than the segment's end.
-bool system_one_render_segments(const system_one_params & cfg,
-                                const std::string & state,
-                                const std::vector<system_one_question> & qs,
-                                std::vector<std::string> & segments,
-                                std::string & err);
+std::vector<std::string> system_one_render_segments(const system_one_params & cfg,
+                                                    const std::string & state,
+                                                    const std::vector<system_one_question> & qs);
 
 struct system_one_tokenized {
     std::vector<llama_token> ids;
@@ -160,41 +163,33 @@ struct system_one_plan {
 };
 
 // Stage one: what the request is, before anything is tokenized.
-bool system_one_build_plan(const system_one_params & cfg,
-                           const llama_vocab * vocab,
-                           const std::string & state,
-                           const std::vector<system_one_question> & qs_in,
-                           system_one_plan & out,
-                           std::string & err);
+system_one_plan system_one_build_plan(const system_one_params & cfg,
+                                      const llama_vocab * vocab,
+                                      const std::string & state,
+                                      const std::vector<system_one_question> & qs_in);
 
 // Stage two, for a caller whose input is all text.
-bool system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params & cfg,
-                              system_one_plan & p, std::string & err);
+void system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params & cfg,
+                              system_one_plan & p);
 
-bool system_one_resolve_question_slots(const llama_vocab * vocab,
-                                       const system_one_params & cfg,
-                                       const std::vector<std::string> & question_segments,
-                                       size_t prefix_positions,
-                                       std::vector<llama_token> & ids_out,
-                                       std::vector<int> & slots_out,
-                                       std::string & err);
+system_one_tokenized system_one_resolve_question_slots(const llama_vocab * vocab,
+                                                       const system_one_params & cfg,
+                                                       const std::vector<std::string> & question_segments,
+                                                       size_t prefix_positions);
 
 
 // One BOS (when the model asks for it), then every segment with add_special = false.
-bool system_one_tokenize_segments(const llama_vocab * vocab,
-                                  const system_one_params & cfg,
-                                  const std::vector<std::string> & segments,
-                                  size_t n_questions,
-                                  system_one_tokenized & out,
-                                  std::string & err);
+system_one_tokenized system_one_tokenize_segments(const llama_vocab * vocab,
+                                                  const system_one_params & cfg,
+                                                  const std::vector<std::string> & segments,
+                                                  size_t n_questions);
 
 
 // Token ids of the label pieces, in `labels` order. Every label must be a single token, since
 // the answer is read as one position's distribution over them.
-bool system_one_label_tokens(const llama_vocab * vocab,
-                             const std::vector<std::string> & labels,
-                             std::vector<llama_token> & out,
-                             std::string * bad = nullptr);
+std::vector<llama_token> system_one_label_tokens(const llama_vocab * vocab,
+                                                 const std::vector<std::string> & labels,
+                                                 bool labels_are_default = false);
 
 struct system_one_answer {
     int                choice = 0;      // argmax over the labels
@@ -235,15 +230,11 @@ system_one_answer system_one_answer_from_scores(const std::vector<float> & score
 // system_one_answer_from_logits() below is the primitive these are built on, for a caller that
 // must read one row while it is briefly valid and cannot wait for the rest -- a server
 // collecting answers as sub-batches come back.
-bool system_one_answers_from_logits(const system_one_plan & p,
-                                    const std::vector<const float *> & rows,
-                                    std::vector<system_one_answer> & out,
-                                    std::string & err);
+std::vector<system_one_answer> system_one_answers_from_logits(const system_one_plan & p,
+                                                              const std::vector<const float *> & rows);
 
-bool system_one_answers_from_scores(const system_one_plan & p,
-                                    const std::vector<float> & scores,
-                                    std::vector<system_one_answer> & out,
-                                    std::string & err);
+std::vector<system_one_answer> system_one_answers_from_scores(const system_one_plan & p,
+                                                              const std::vector<float> & scores);
 
 // What the readout requires of a context -- not how big to make it, which is the caller's
 // business, but the part the checkpoint dictates: a rank_head answer is a classification

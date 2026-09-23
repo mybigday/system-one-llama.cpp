@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -207,8 +208,7 @@ static bool collect_questions(const common_params & params,
 // its scheduler instead; neither is more correct, they just own different batching.
 
 // The slot readouts: one decode over the whole sequence, logits asked for at the answer slots.
-static bool decode_slots(llama_context * ctx, const system_one_plan & p,
-                         std::vector<system_one_answer> & out, std::string & err) {
+static std::vector<system_one_answer> decode_slots(llama_context * ctx, const system_one_plan & p) {
     const auto & t = p.sequences.front().tok;
 
     llama_batch batch = llama_batch_init((int32_t) t.ids.size(), 0, 1);
@@ -223,8 +223,7 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
     for (int slot : t.slots) {
         if (slot < 0 || slot >= (int) t.ids.size()) {
             llama_batch_free(batch);
-            err = "answer slot outside the sequence";
-            return false;
+            throw std::runtime_error("answer slot outside the sequence");
         }
         batch.logits[slot] = 1;
     }
@@ -232,8 +231,7 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
     const int rc = llama_decode(ctx, batch);
     llama_batch_free(batch);
     if (rc != 0) {
-        err = "llama_decode failed with " + std::to_string(rc);
-        return false;
+        throw std::runtime_error("llama_decode failed with " + std::to_string(rc));
     }
 
     // Which labels to read and how many options each question declared are the plan's to
@@ -242,11 +240,10 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
     for (size_t qi = 0; qi < t.slots.size(); qi++) {
         rows[qi] = llama_get_logits_ith(ctx, t.slots[qi]);
         if (rows[qi] == nullptr) {
-            err = "no logits at answer slot " + std::to_string(qi);
-            return false;
+            throw std::runtime_error("no logits at answer slot " + std::to_string(qi));
         }
     }
-    return system_one_answers_from_logits(p, rows, out, err);
+    return system_one_answers_from_logits(p, rows);
 }
 
 // rank_head: one sequence per option, scored by the model's head. They are independent, so as
@@ -257,8 +254,7 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
 // When the plan says the sequences may share their prefix -- the state and the question, which
 // only a causal model can share because a bidirectional one recomputes them from what follows
 // -- the head is decoded once and its KV copied, so the state costs one pass instead of K.
-static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
-                          std::vector<system_one_answer> & out, std::string & err) {
+static std::vector<system_one_answer> decode_ranked(llama_context * ctx, const system_one_plan & p) {
     const uint32_t n_ubatch  = llama_n_ubatch(ctx);
     const uint32_t n_seq_max = llama_n_seq_max(ctx);
 
@@ -270,9 +266,8 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         while (i + n_seq < p.sequences.size() && n_seq < n_seq_max) {
             const size_t len = p.sequences[i + n_seq].tok.ids.size();
             if (len > n_ubatch) {
-                err = "one option sequence is " + std::to_string(len) +
-                      " tokens, more than the micro-batch (" + std::to_string(n_ubatch) + ") -- raise -ub";
-                return false;
+                throw std::runtime_error("one option sequence is " + std::to_string(len) +
+                      " tokens, more than the micro-batch (" + std::to_string(n_ubatch) + ") -- raise -ub");
             }
             if (n_tok + len > n_ubatch) break;
             n_tok += len;
@@ -308,8 +303,7 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
             const int rc = llama_decode(ctx, pre);
             llama_batch_free(pre);
             if (rc != 0) {
-                err = "llama_decode failed on the shared prefix";
-                return false;
+                throw std::runtime_error("llama_decode failed on the shared prefix");
             }
             for (size_t k = 1; k < n_seq; k++) {
                 llama_memory_seq_cp(llama_get_memory(ctx), 0, (llama_seq_id) k, 0, (llama_pos) n_prefix);
@@ -332,15 +326,13 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         const int rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
         if (rc != 0) {
-            err = "llama_decode failed on the batch starting at sequence " + std::to_string(i);
-            return false;
+            throw std::runtime_error("llama_decode failed on the batch starting at sequence " + std::to_string(i));
         }
 
         for (size_t k = 0; k < n_seq; k++) {
             const float * pooled = llama_get_embeddings_seq(ctx, (llama_seq_id) k);
             if (pooled == nullptr) {
-                err = "the model returned no pooled score -- is it a classification head?";
-                return false;
+                throw std::runtime_error("the model returned no pooled score -- is it a classification head?");
             }
             scores[i + k] = pooled[0];
         }
@@ -348,7 +340,7 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         i += n_seq;
     }
 
-    return system_one_answers_from_scores(p, scores, out, err);
+    return system_one_answers_from_scores(p, scores);
 }
 
 int main(int argc, char ** argv) {
@@ -373,8 +365,10 @@ int main(int argc, char ** argv) {
 
     system_one_params cfg;
     std::string err;
-    if (!system_one_params_from_model(model, cfg, err)) {
-        LOG_ERR("%s: %s\n", __func__, err.c_str());
+    try {
+        cfg = system_one_params_from_model(model);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
         llama_model_free(model);
         return 1;
     }
@@ -419,9 +413,11 @@ int main(int argc, char ** argv) {
         cfg.labels_are_default = false;
     }
 
-    if (!system_one_build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
-        !system_one_tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
-        LOG_ERR("%s: %s\n", __func__, err.c_str());
+    try {
+        plan = system_one_build_plan(cfg, llama_model_get_vocab(model), state, qs);
+        system_one_tokenize_plan(llama_model_get_vocab(model), cfg, plan);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
         llama_model_free(model);
         return 1;
     }
@@ -468,10 +464,10 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<system_one_answer> answers;
-    const bool ok = plan.rank_pooling ? decode_ranked(ctx, plan, answers, err)
-                                      : decode_slots (ctx, plan, answers, err);
-    if (!ok) {
-        LOG_ERR("%s: %s\n", __func__, err.c_str());
+    try {
+        answers = plan.rank_pooling ? decode_ranked(ctx, plan) : decode_slots(ctx, plan);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
         llama_free(ctx); llama_model_free(model);
         return 1;
     }
