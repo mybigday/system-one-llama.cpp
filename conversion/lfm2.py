@@ -94,6 +94,25 @@ class LFM2ColBertModel(LFM2Model):
         yield f"{self.dense_tensor_name}.weight", tensor.clone()
 
 
+@ModelBase.register("Lfm2BidirectionalForMaskedLM")
+@ModelBase.example("LiquidAI/LFM2.5-Encoder-350M")
+class LFM2BidirectionalMaskedLMModel(LFM2Model):
+    model_arch = gguf.MODEL_ARCH.LFM2
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # the whole point of the encoder variant: every position sees every other
+        self.gguf_writer.add_causal_attention(False)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # the backbone sits under "lfm2." here rather than "model."; lm_head is tied to the
+        # embeddings and is not stored, so there is no output tensor to map
+        if name.startswith("lfm2."):
+            name = "model." + name[len("lfm2."):]
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Lfm2MoeForCausalLM")
 @ModelBase.example("LiquidAI/LFM2-8B-A1B")
 class LFM2MoeModel(TextModel):
