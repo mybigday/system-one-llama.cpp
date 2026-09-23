@@ -1906,6 +1906,11 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_geglu(ctx0, cur);
                 cb(cur, "ffn_geglu", il);
             } break;
+        case LLM_FFN_GEGLU_ERF:
+            {
+                cur = ggml_geglu_erf(ctx0, cur);
+                cb(cur, "ffn_geglu_erf", il);
+            } break;
         case LLM_FFN_REGLU:
             {
                 cur = ggml_reglu(ctx0, cur);
@@ -3739,7 +3744,10 @@ void llm_graph_context::build_pooling(
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
                     if (arch == LLM_ARCH_MODERN_BERT) {
-                        cur = ggml_gelu(ctx0, cur);
+                        // ModernBertPredictionHead uses config.classifier_activation, which is
+                        // "gelu" -- and in transformers that name is the exact erf one, the tanh
+                        // approximation being spelled "gelu_pytorch_tanh"
+                        cur = ggml_gelu_erf(ctx0, cur);
                     } else {
                         cur = ggml_tanh(ctx0, cur);
                     }

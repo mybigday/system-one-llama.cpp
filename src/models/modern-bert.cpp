@@ -14,10 +14,10 @@ void llama_model_modern_bert::load_arch_hparams(llama_model_loader & ml) {
 
     // Some ModernBert derivatives (e.g. IBM Granite Embedding 97m R2) use
     // SiLU/SwiGLU in the FFN instead of the default GELU/GeGLU.
-    hparams.llm_ffn_op = LLM_FFN_GEGLU;
+    hparams.llm_ffn_op = LLM_FFN_GEGLU_ERF;
     std::string hidden_act;
     if (ml.get_key(LLM_KV_HIDDEN_ACT, hidden_act, false)) {
-        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_GEGLU);
+        hparams.llm_ffn_op = llm_ffn_op_type_from_string(hidden_act, LLM_FFN_GEGLU_ERF);
     }
 
     switch (hparams.n_layer()) {
@@ -62,6 +62,7 @@ void llama_model_modern_bert::load_arch_tensors(llama_model_loader &) {
     cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT,  "bias"),   {hparams.n_cls_out},         TENSOR_NOT_REQUIRED);
     cls       = create_tensor(tn(LLM_TENSOR_CLS,      "weight"), {n_embd, n_embd},            TENSOR_NOT_REQUIRED);
     cls_norm  = create_tensor(tn(LLM_TENSOR_CLS_NORM, "weight"), {n_embd},                    TENSOR_NOT_REQUIRED);
+
 
 }
 
@@ -168,5 +169,6 @@ llama_model_modern_bert::graph::graph(const llama_model & model, const llm_graph
     cb(cur, "final_norm_out", -1);
 
     res->t_embd = cur;
+
     ggml_build_forward_expand(gf, cur);
 }
