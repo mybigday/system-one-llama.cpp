@@ -163,7 +163,9 @@ struct server_task {
 
         // a bidirectional readout cannot reuse a cached prefix: every position attends to
         // every other, so a changed tail changes the representation of the head too
-        bool no_prefix_reuse = false;
+        // how far a reused prompt prefix may extend into this sequence; the library works it
+        // out from the readout and the model, so nothing here has to re-derive it
+        size_t n_reusable = 0;
     };
     system_one_spec system_one;
 

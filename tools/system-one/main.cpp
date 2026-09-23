@@ -262,7 +262,7 @@ static bool decode_ranked(llama_context * ctx, const system_one::plan & p,
 
         // the prefix every sequence in this chunk agrees on, if sharing is allowed at all
         size_t n_prefix = 0;
-        if (p.share_prefix && n_seq > 1) {
+        if (n_seq > 1) {
             n_prefix = p.sequences[i + 1].n_shared;
             for (size_t k = 2; k < n_seq; k++) {
                 n_prefix = std::min(n_prefix, p.sequences[i + k].n_shared);

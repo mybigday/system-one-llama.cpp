@@ -373,8 +373,6 @@ bool build_layout(const so_config & cfg,
     if (cfg.ranked()) {
         // the head scores a whole sequence, so each option gets one of its own
         out.rank_pooling = true;
-        out.share_prefix = cfg.causal;   // see plan::share_prefix
-        out.prefix_reuse = false;   // the sequences differ from the first token onwards
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
             for (size_t oi = 0; oi < qs[qi].options.size(); oi++) {
@@ -408,8 +406,6 @@ bool build_layout(const so_config & cfg,
     seq.n_question_segments = qs.size();
     out.sequences.push_back(std::move(seq));
 
-    // a bidirectional readout reads from inside the canvas, so no prefix survives a change
-    out.prefix_reuse = !cfg.masked();
     return true;
 }
 
@@ -426,8 +422,6 @@ bool build_plan(const so_config & cfg,
     out.n_options    = lay.n_options;
     out.labels       = lay.labels;
     out.rank_pooling = lay.rank_pooling;
-    out.prefix_reuse = lay.prefix_reuse;
-    out.share_prefix = lay.share_prefix;
 
     for (const auto & ls : lay.sequences) {
         plan::sequence seq;
@@ -439,14 +433,30 @@ bool build_plan(const so_config & cfg,
         out.sequences.push_back(std::move(seq));
     }
 
+    // Reuse is legal exactly where the model is causal: on a bidirectional one the prefix's
+    // representation depends on what follows it, so the same tokens are not the same
+    // computation. Everything below is therefore zero unless cfg.causal, and a caller can act
+    // on these numbers without re-deriving the rule.
+    //
+    // How far reuse may go is a separate matter: an answer read from inside the sequence must
+    // not end up inside the reused part, or its slot is never decoded and has no logits. The
+    // state comes before the questions, so a growing transcript still reuses everything up to
+    // where it changed.
+    for (auto & seq : out.sequences) {
+        if (!cfg.causal) continue;
+        seq.n_reusable = seq.tok.slots.empty()
+            ? seq.tok.ids.size()
+            : (size_t) *std::min_element(seq.tok.slots.begin(), seq.tok.slots.end());
+    }
+
     // The option sequences of one question differ only in the option, so they share a long
     // head -- the state and the question. Measure it rather than assume where it ends: the
-    // template decides the layout, and a caller that can use it gets the state encoded once
-    // instead of once per option.
+    // template decides the layout.
     for (size_t i = 0; i < out.sequences.size(); i++) {
         auto & seq = out.sequences[i];
         seq.shares_with = i;
         seq.n_shared    = 0;
+        if (!cfg.causal) continue;
 
         for (size_t j = 0; j < i; j++) {
             if (out.sequences[j].question != seq.question) continue;
@@ -545,7 +555,10 @@ context_needs required_context(const so_config & cfg, const plan & p) {
         need.pooling_type = LLAMA_POOLING_TYPE_RANK;
     }
 
-    need.share_prefix = p.share_prefix && p.sequences.size() > 1;
+    need.share_prefix = false;
+    for (const auto & seq : p.sequences) {
+        need.share_prefix |= seq.n_shared > 0;
+    }
     need.n_seq = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
     for (size_t i = 0; i < need.n_seq; i++) {
         need.n_tokens += p.sequences[i].tok.ids.size();

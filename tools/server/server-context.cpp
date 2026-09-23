@@ -3457,19 +3457,14 @@ private:
                             }
                         }
 
-                        // System One reads its answers from inside the prompt, so the reusable
-                        // prefix must stop before the first answer slot -- otherwise that slot is
-                        // never decoded and has no logits. The state precedes the questions, so a
-                        // growing transcript still reuses everything up to where it changed.
-                        if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.task->system_one.slots.empty()) {
-                            const auto & so_slots = slot.task->system_one.slots;
-                            const int32_t first_answer = slot.task->system_one.no_prefix_reuse
-                                ? 0
-                                : *std::min_element(so_slots.begin(), so_slots.end());
-                            if (n_past > first_answer) {
-                                SLT_DBG(slot, "capping prompt reuse at the first answer slot (n_past = %d -> %d)\n",
-                                        n_past, first_answer);
-                                n_past = first_answer;
+                        // How much of a System One prompt may come from the cache is the
+                        // library's answer, not ours: it knows whether the model is causal at
+                        // all and where the answers are read from inside the prompt.
+                        if (slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE) {
+                            const int32_t n_reusable = (int32_t) slot.task->system_one.n_reusable;
+                            if (n_past > n_reusable) {
+                                SLT_DBG(slot, "capping prompt reuse (n_past = %d -> %d)\n", n_past, n_reusable);
+                                n_past = n_reusable;
                             }
                         }
 
@@ -5650,7 +5645,7 @@ const json & st = body.at("state");
                 task.system_one.slots           = state_files.empty() ? seq.tok.slots : media_slots;
                 task.system_one.letters         = plan.labels;
                 task.system_one.n_options       = plan.n_options;
-                task.system_one.no_prefix_reuse = !plan.prefix_reuse;
+                task.system_one.n_reusable      = seq.n_reusable;
                 rd_slot.post_task(std::move(task));
             }
 
