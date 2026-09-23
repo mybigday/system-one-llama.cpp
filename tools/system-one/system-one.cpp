@@ -3,7 +3,6 @@
 #include "chat.h"                 // pulls in the jinja engine the chat templates use
 #include "common.h"               // common_tokenize, string_split
 #include "json.h"
-#include "log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,78 +11,9 @@
 using json = common_json;
 
 
-// ---------------------------------------------------------------- the opaque types
-//
-// Declared in the header, defined here: that is what makes them opaque to a C caller, and it
-// is why the implementation below can go on using std::string and std::vector throughout.
-
-struct system_one_params {
-    std::string template_src;                  // the named chat template `system_one`
-    std::string segment_separator = "\x1e";    // system_one.segment_separator
-
-    enum system_one_readout readout = SYSTEM_ONE_READOUT_LETTER_SLOT;
-
-    std::vector<std::string> labels;           // system_one.labels, or A-Za-z
-    bool labels_are_default = false;
-
-    bool causal = true;                        // {arch}.attention.causal
-
-    llama_token mask_token = -1;               // tokenizer.ggml.mask_token_id
-    std::string mask_text;                     // its piece, so a template can write it
-    std::string bos_text;                      // likewise for BOS: the template writes it, as
-    std::string eos_text;                      // chat templates do, not a "prepend one" flag
-};
-
-struct system_one_tokenized {
-    std::vector<llama_token> ids;
-    std::vector<int32_t>     slots;   // one per question
-};
-
-struct system_one_sequence {
-    // stage one: what this sequence renders to. The trailing n_question_segments are the
-    // question blocks; everything before them is the state.
-    std::vector<std::string> segments;
-    size_t n_question_segments = 0;
-
-    size_t question = 0;   // rank_head: the question this sequence scores
-    size_t option   = 0;   // rank_head: the option it scores
-
-    // stage two: what that tokenized to, and where the answers sit in it
-    system_one_tokenized tok;
-
-    size_t n_reusable  = 0;
-    size_t shares_with = 0;
-    size_t n_shared    = 0;
-};
-
-struct system_one_plan {
-    std::vector<system_one_sequence> sequences;
-    std::vector<int32_t>             n_options;   // per question, in request order
-    std::vector<llama_token>         labels;      // label token ids; empty for rank_head
-
-    bool rank_pooling = false;
-};
-
-struct system_one_answer {
-    int32_t            choice     = 0;   // argmax over the labels
-    float              confidence = 0;   // 1 - H(p)/ln K
-    std::vector<float> logits;
-    std::vector<float> probs;
-};
-
-struct system_one_answers {
-    std::vector<system_one_answer> entries;
-};
-
-// The detail goes to the log and the call returns a code, which is what every other llama.cpp
-// entry point does. These messages name the offending question or label, so they are worth
-// printing in full -- but what *kind* of failure it was is the caller's call site, not a value.
-static void log_err(const std::string & msg) {
-    LOG_ERR("system-one: %s\n", msg.c_str());
-}
-
-
-static system_one_answer answer_from_scores(const std::vector<float> & scores);
+system_one_answer system_one_answer_from_logits(const float * row,
+                                                const std::vector<llama_token> & letter_ids,
+                                                int n_options);
 
 // ---------------------------------------------------------------- model metadata
 
@@ -126,7 +56,7 @@ static bool readout_from_name(const std::string & name, enum system_one_readout 
     return false;
 }
 
-static bool params_from_model(const llama_model * model, system_one_params & out, std::string & err) {
+bool system_one_params_from_model(const llama_model * model, system_one_params & out, std::string & err) {
     const char * tmpl = llama_model_chat_template(model, "system_one");
     if (tmpl == nullptr || tmpl[0] == '\0') {
         err = "model has no System One template (tokenizer.chat_template.system_one); "
@@ -248,9 +178,9 @@ static bool render_and_split(const system_one_params & cfg, const json & inp,
     return true;
 }
 
-static bool render_segments(const system_one_params & cfg,
+bool system_one_render_segments(const system_one_params & cfg,
                      const std::string & state,
-                     const std::vector<system_one::question> & qs,
+                     const std::vector<system_one_question> & qs,
                      std::vector<std::string> & segments,
                      std::string & err) {
     if (cfg.segment_separator.empty()) {
@@ -260,7 +190,7 @@ static bool render_segments(const system_one_params & cfg,
 
     json questions = json::array();
     for (size_t i = 0; i < qs.size(); i++) {
-        const system_one::question & q = qs[i];
+        const system_one_question & q = qs[i];
         json options = json::array();
         for (size_t j = 0; j < q.options.size(); j++) {
             const bool has_desc = j < q.descs.size() && !q.descs[j].empty();
@@ -299,7 +229,7 @@ static bool render_segments(const system_one_params & cfg,
 
 static bool render_pair_segments(const system_one_params & cfg,
                           const std::string & state,
-                          const system_one::question & q,
+                          const system_one_question & q,
                           size_t option_index,
                           std::vector<std::string> & segments,
                           std::string & err) {
@@ -337,7 +267,7 @@ static bool render_pair_segments(const system_one_params & cfg,
 
 // ---------------------------------------------------------------- tokenization
 
-static bool resolve_question_slots(const llama_vocab * vocab,
+bool system_one_resolve_question_slots(const llama_vocab * vocab,
                             const system_one_params & cfg,
                             const std::vector<std::string> & question_segments,
                             size_t prefix_positions,
@@ -381,7 +311,7 @@ static bool resolve_question_slots(const llama_vocab * vocab,
     return true;
 }
 
-static bool tokenize_segments(const llama_vocab * vocab,
+bool system_one_tokenize_segments(const llama_vocab * vocab,
                        const system_one_params & cfg,
                        const std::vector<std::string> & segments,
                        size_t n_questions,
@@ -408,14 +338,14 @@ static bool tokenize_segments(const llama_vocab * vocab,
 
     std::vector<llama_token> q_ids;
     const std::vector<std::string> q_segments(segments.begin() + first_question, segments.end());
-    if (!resolve_question_slots(vocab, cfg, q_segments, out.ids.size(), q_ids, out.slots, err)) {
+    if (!system_one_resolve_question_slots(vocab, cfg, q_segments, out.ids.size(), q_ids, out.slots, err)) {
         return false;
     }
     out.ids.insert(out.ids.end(), q_ids.begin(), q_ids.end());
     return true;
 }
 
-static bool label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
+bool system_one_label_tokens(const llama_vocab * vocab, const std::vector<std::string> & labels,
                   std::vector<llama_token> & out, std::string * bad) {
     // Tokenize each label rather than matching vocab text: a label is read at the position
     // where the template would have written it, so it has to be what the tokenizer produces
@@ -435,10 +365,10 @@ static bool label_tokens(const llama_vocab * vocab, const std::vector<std::strin
 
 // ---------------------------------------------------------------- planning
 
-static bool build_plan(const system_one_params & cfg,
+bool system_one_build_plan(const system_one_params & cfg,
                 const llama_vocab * vocab,
                 const std::string & state,
-                const std::vector<system_one::question> & qs_in,
+                const std::vector<system_one_question> & qs_in,
                 system_one_plan & out,
                 std::string & err) {
     out = system_one_plan();
@@ -450,7 +380,7 @@ static bool build_plan(const system_one_params & cfg,
     // The two sides of a yes/no question are a property of the format, not of the caller:
     // every front end would otherwise have to know to spell them "no" and "yes". A caller
     // that wants them worded differently still may -- this only fills in the blank.
-    std::vector<system_one::question> qs;
+    std::vector<system_one_question> qs;
     qs.reserve(qs_in.size());
     for (auto q : qs_in) {
         if (q.kind == SYSTEM_ONE_KIND_NOUL && q.options.empty()) {
@@ -486,7 +416,7 @@ static bool build_plan(const system_one_params & cfg,
 
     // a slot readout answers every question from one sequence
     std::string bad;
-    if (!label_tokens(vocab, cfg.labels, out.labels, &bad)) {
+    if (!system_one_label_tokens(vocab, cfg.labels, out.labels, &bad)) {
         err = "the answer label \"" + bad + "\" is not a single token for this tokenizer; "
               + (cfg.labels_are_default
                  ? "it comes from the default A-Za-z alphabet, not from anything this request "
@@ -505,17 +435,17 @@ static bool build_plan(const system_one_params & cfg,
     }
 
     system_one_sequence seq;
-    if (!render_segments(cfg, state, qs, seq.segments, err)) return false;
+    if (!system_one_render_segments(cfg, state, qs, seq.segments, err)) return false;
     seq.n_question_segments = qs.size();
     out.sequences.push_back(std::move(seq));
 
     return true;
 }
 
-static bool tokenize_plan(const llama_vocab * vocab, const system_one_params & cfg,
+bool system_one_tokenize_plan(const llama_vocab * vocab, const system_one_params & cfg,
                               system_one_plan & p, std::string & err) {
     for (auto & seq : p.sequences) {
-        if (!tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments, seq.tok, err)) {
+        if (!system_one_tokenize_segments(vocab, cfg, seq.segments, seq.n_question_segments, seq.tok, err)) {
             return false;
         }
     }
@@ -563,7 +493,34 @@ static bool tokenize_plan(const llama_vocab * vocab, const system_one_params & c
     return true;
 }
 
-static bool answers_from_scores(const system_one_plan & p, const std::vector<float> & scores,
+bool system_one_answers_from_logits(const system_one_plan & p,
+                                    const std::vector<const float *> & rows,
+                                    std::vector<system_one_answer> & out,
+                                    std::string & err) {
+    if (p.rank_pooling) {
+        err = "this readout is scored by the model's head, not read at a slot -- "
+              "use system_one_answers_from_scores()";
+        return false;
+    }
+    if (rows.size() != p.n_options.size()) {
+        err = "got " + std::to_string(rows.size()) + " logit rows for " +
+              std::to_string(p.n_options.size()) + " questions";
+        return false;
+    }
+
+    out.clear();
+    out.reserve(rows.size());
+    for (size_t qi = 0; qi < rows.size(); qi++) {
+        if (rows[qi] == nullptr) {
+            err = "no logits for question " + std::to_string(qi);
+            return false;
+        }
+        out.push_back(system_one_answer_from_logits(rows[qi], p.labels, p.n_options[qi]));
+    }
+    return true;
+}
+
+bool system_one_answers_from_scores(const system_one_plan & p, const std::vector<float> & scores,
                          std::vector<system_one_answer> & out, std::string & err) {
     if (scores.size() != p.sequences.size()) {
         err = "expected one score per planned sequence";
@@ -586,7 +543,7 @@ static bool answers_from_scores(const system_one_plan & p, const std::vector<flo
             err = "a question did not get one score per option";
             return false;
         }
-        out[qi] = answer_from_scores(per_question[qi]);
+        out[qi] = system_one_answer_from_scores(per_question[qi]);
     }
     return true;
 }
@@ -602,7 +559,7 @@ static std::vector<float> softmax(const std::vector<float> & x) {
     return p;
 }
 
-static system_one_answer answer_from_scores(const std::vector<float> & scores) {
+system_one_answer system_one_answer_from_scores(const std::vector<float> & scores) {
     system_one_answer a;
     a.logits = scores;                 // the head's raw output, as the caller gets it
     a.probs  = softmax(scores);
@@ -619,14 +576,14 @@ static system_one_answer answer_from_scores(const std::vector<float> & scores) {
     return a;
 }
 
-static system_one_answer answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
+system_one_answer system_one_answer_from_logits(const float * row, const std::vector<llama_token> & letter_ids, int n_options) {
     // the only difference between the two readouts is where the numbers come from
     std::vector<float> scores(n_options);
     for (int j = 0; j < n_options; j++) scores[j] = row[letter_ids[j]];
-    return answer_from_scores(scores);
+    return system_one_answer_from_scores(scores);
 }
 
-static void apply_temperature(system_one_answer & a, float t) {
+void system_one_apply_temperature(system_one_answer & a, float t) {
     if (t <= 0.0f || std::fabs(t - 1.0f) <= 1e-6f || a.logits.empty()) {
         return;
     }
@@ -646,13 +603,13 @@ static void apply_temperature(system_one_answer & a, float t) {
     }
 }
 
-static float score_expectation(const system_one_answer & a) {
+float system_one_score_expectation(const system_one_answer & a) {
     double e = 0.0;
     for (size_t i = 0; i < a.probs.size(); i++) e += (double) i * (double) a.probs[i];
     return (float) e;
 }
 
-static system_one_context_needs required_context(const system_one_params & cfg) {
+system_one_context_needs system_one_required_context(const system_one_params & cfg) {
     system_one_context_needs need;
 
     if (cfg.readout == SYSTEM_ONE_READOUT_RANK_HEAD) {
@@ -665,441 +622,3 @@ static system_one_context_needs required_context(const system_one_params & cfg) 
     return need;
 }
 
-
-// ---------------------------------------------------------------- the C API
-//
-// Everything above is the implementation, in C++ and free to stay that way. Everything below
-// is the surface a C caller sees: opaque handles, pointer-plus-count reads, and a caller
-// buffer for the error text.
-
-//
-// system_one_params
-//
-
-system_one_params * system_one_params_init(void) {
-    auto out = std::unique_ptr<system_one_params>(new system_one_params());
-    // the usual alphabet, so a plain letter format needs no key at all
-    out->labels_are_default = true;
-    for (char ch = 'A'; ch <= 'Z'; ch++) out->labels.push_back(std::string(1, ch));
-    for (char ch = 'a'; ch <= 'z'; ch++) out->labels.push_back(std::string(1, ch));
-    return out.release();
-}
-
-system_one_params * system_one_params_init_from_model(const llama_model * model) {
-    if (model == nullptr) {
-        log_err("no model");
-        return nullptr;
-    }
-
-    auto out = std::unique_ptr<system_one_params>(new system_one_params());
-
-    std::string msg;
-    if (!params_from_model(model, *out, msg)) {
-        log_err(msg);
-        return nullptr;
-    }
-    return out.release();
-}
-
-void system_one_params_free(system_one_params * params) {
-    delete params;
-}
-
-enum system_one_readout system_one_params_get_readout(const system_one_params * params) {
-    return params->readout;
-}
-
-void system_one_params_set_readout(system_one_params * params, enum system_one_readout readout) {
-    params->readout = readout;
-}
-
-const char * system_one_params_get_template(const system_one_params * params) {
-    return params->template_src.c_str();
-}
-
-void system_one_params_set_template(system_one_params * params, const char * jinja) {
-    params->template_src = jinja ? jinja : "";
-}
-
-const char * system_one_params_get_segment_separator(const system_one_params * params) {
-    return params->segment_separator.c_str();
-}
-
-const char * system_one_params_get_bos_text(const system_one_params * params) {
-    return params->bos_text.c_str();
-}
-
-size_t system_one_params_get_n_labels(const system_one_params * params) {
-    return params->labels.size();
-}
-
-const char * system_one_params_get_label(const system_one_params * params, size_t i) {
-    return i < params->labels.size() ? params->labels[i].c_str() : nullptr;
-}
-
-void system_one_params_set_labels(system_one_params * params, const char * const * labels, size_t n_labels) {
-    params->labels.clear();
-    for (size_t i = 0; i < n_labels; i++) {
-        if (labels[i]) params->labels.push_back(labels[i]);
-    }
-    // a label the caller chose is never the default alphabet, which is what the error text
-    // for an unresolvable label keys off
-    params->labels_are_default = false;
-}
-
-bool system_one_params_get_causal(const system_one_params * params) {
-    return params->causal;
-}
-
-struct system_one_context_needs system_one_params_get_context_needs(const system_one_params * params) {
-    return required_context(*params);
-}
-
-//
-// system_one_plan
-//
-
-// The C struct borrows its strings; the internals want owned ones, and noul's two sides are
-// still the readout's business rather than the caller's.
-static std::vector<system_one::question> questions_from_c(const struct system_one_question * qs, size_t n) {
-    std::vector<system_one::question> out;
-    out.reserve(n);
-    for (size_t i = 0; i < n; i++) {
-        system_one::question q;
-        q.kind = qs[i].kind;
-        q.text = qs[i].text ? qs[i].text : "";
-        for (size_t j = 0; j < qs[i].n_options; j++) {
-            q.options.push_back(qs[i].options && qs[i].options[j] ? qs[i].options[j] : "");
-            q.descs.push_back(qs[i].descs && qs[i].descs[j] ? qs[i].descs[j] : "");
-        }
-        out.push_back(std::move(q));
-    }
-    return out;
-}
-
-system_one_plan * system_one_plan_init(const system_one_params * params,
-                                       const llama_vocab * vocab,
-                                       const char * state,
-                                       const struct system_one_question * questions,
-                                       size_t n_questions) {
-    if (params == nullptr || vocab == nullptr) {
-        log_err("no params or no vocab");
-        return nullptr;
-    }
-    if (questions == nullptr && n_questions > 0) {
-        log_err("n_questions is non-zero but no questions were given");
-        return nullptr;
-    }
-
-    auto out = std::unique_ptr<system_one_plan>(new system_one_plan());
-
-    std::string msg;
-    if (!build_plan(*params, vocab, state ? state : "", questions_from_c(questions, n_questions), *out, msg)) {
-        log_err(msg);
-        return nullptr;
-    }
-    return out.release();
-}
-
-void system_one_plan_free(system_one_plan * plan) {
-    delete plan;
-}
-
-int32_t system_one_plan_tokenize(system_one_plan * plan,
-                                 const llama_vocab * vocab,
-                                 const system_one_params * params) {
-    if (plan == nullptr || vocab == nullptr || params == nullptr) {
-        log_err("no plan, no vocab or no params");
-        return 1;
-    }
-
-    std::string msg;
-    if (!tokenize_plan(vocab, *params, *plan, msg)) {
-        log_err(msg);
-        return 1;
-    }
-    return 0;
-}
-
-size_t system_one_plan_get_n_sequences(const system_one_plan * plan) {
-    return plan->sequences.size();
-}
-
-size_t system_one_plan_get_n_questions(const system_one_plan * plan) {
-    return plan->n_options.size();
-}
-
-int32_t system_one_plan_get_n_options(const system_one_plan * plan, size_t question) {
-    return question < plan->n_options.size() ? plan->n_options[question] : 0;
-}
-
-bool system_one_plan_get_rank_pooling(const system_one_plan * plan) {
-    return plan->rank_pooling;
-}
-
-const llama_token * system_one_plan_get_labels(const system_one_plan * plan, size_t * n_out) {
-    if (n_out) *n_out = plan->labels.size();
-    return plan->labels.empty() ? nullptr : plan->labels.data();
-}
-
-const system_one_sequence * system_one_plan_get_sequence(const system_one_plan * plan, size_t i) {
-    return i < plan->sequences.size() ? &plan->sequences[i] : nullptr;
-}
-
-//
-// system_one_sequence
-//
-
-size_t system_one_sequence_get_n_segments(const system_one_sequence * seq) {
-    return seq->segments.size();
-}
-
-const char * system_one_sequence_get_segment(const system_one_sequence * seq, size_t i) {
-    return i < seq->segments.size() ? seq->segments[i].c_str() : nullptr;
-}
-
-size_t system_one_sequence_get_n_question_segments(const system_one_sequence * seq) {
-    return seq->n_question_segments;
-}
-
-size_t system_one_sequence_get_question(const system_one_sequence * seq) {
-    return seq->question;
-}
-
-size_t system_one_sequence_get_option(const system_one_sequence * seq) {
-    return seq->option;
-}
-
-const system_one_tokenized * system_one_sequence_get_tokenized(const system_one_sequence * seq) {
-    return &seq->tok;
-}
-
-size_t system_one_sequence_get_n_reusable(const system_one_sequence * seq) {
-    return seq->n_reusable;
-}
-
-size_t system_one_sequence_get_shares_with(const system_one_sequence * seq) {
-    return seq->shares_with;
-}
-
-size_t system_one_sequence_get_n_shared(const system_one_sequence * seq) {
-    return seq->n_shared;
-}
-
-//
-// system_one_tokenized
-//
-
-system_one_tokenized * system_one_tokenized_init(void) {
-    return new system_one_tokenized();
-}
-
-void system_one_tokenized_free(system_one_tokenized * tok) {
-    delete tok;
-}
-
-const llama_token * system_one_tokenized_get_tokens(const system_one_tokenized * tok, size_t * n_out) {
-    if (n_out) *n_out = tok->ids.size();
-    return tok->ids.empty() ? nullptr : tok->ids.data();
-}
-
-const int32_t * system_one_tokenized_get_slots(const system_one_tokenized * tok, size_t * n_out) {
-    if (n_out) *n_out = tok->slots.size();
-    return tok->slots.empty() ? nullptr : tok->slots.data();
-}
-
-int32_t system_one_resolve_question_slots(const llama_vocab * vocab,
-                                          const system_one_params * params,
-                                          const char * const * question_segments,
-                                          size_t n_segments,
-                                          size_t prefix_positions,
-                                          system_one_tokenized * out) {
-    if (vocab == nullptr || params == nullptr || out == nullptr) {
-        log_err("no vocab, no params or no output");
-        return 1;
-    }
-
-    std::vector<std::string> segments;
-    segments.reserve(n_segments);
-    for (size_t i = 0; i < n_segments; i++) {
-        segments.push_back(question_segments && question_segments[i] ? question_segments[i] : "");
-    }
-
-    out->ids.clear();
-    out->slots.clear();
-
-    std::string msg;
-    if (!resolve_question_slots(vocab, *params, segments, prefix_positions, out->ids, out->slots, msg)) {
-        log_err(msg);
-        return 1;
-    }
-    return 0;
-}
-
-//
-// system_one_answer
-//
-
-system_one_answer * system_one_answer_init_from_logits(const float * row,
-                                                       const llama_token * labels,
-                                                       size_t n_labels,
-                                                       int32_t n_options) {
-    if (row == nullptr || labels == nullptr || n_options <= 0 || (size_t) n_options > n_labels) {
-        return nullptr;
-    }
-    const std::vector<llama_token> ids(labels, labels + n_labels);
-    return new system_one_answer(answer_from_logits(row, ids, n_options));
-}
-
-system_one_answer * system_one_answer_init_from_scores(const float * scores, size_t n_scores) {
-    if (scores == nullptr || n_scores == 0) {
-        return nullptr;
-    }
-    return new system_one_answer(answer_from_scores(std::vector<float>(scores, scores + n_scores)));
-}
-
-void system_one_answer_free(system_one_answer * answer) {
-    delete answer;
-}
-
-int32_t system_one_answer_get_choice(const system_one_answer * answer) {
-    return answer->choice;
-}
-
-float system_one_answer_get_confidence(const system_one_answer * answer) {
-    return answer->confidence;
-}
-
-const float * system_one_answer_get_probs(const system_one_answer * answer, size_t * n_out) {
-    if (n_out) *n_out = answer->probs.size();
-    return answer->probs.empty() ? nullptr : answer->probs.data();
-}
-
-const float * system_one_answer_get_logits(const system_one_answer * answer, size_t * n_out) {
-    if (n_out) *n_out = answer->logits.size();
-    return answer->logits.empty() ? nullptr : answer->logits.data();
-}
-
-float system_one_answer_get_score_expectation(const system_one_answer * answer) {
-    return score_expectation(*answer);
-}
-
-void system_one_answer_apply_temperature(system_one_answer * answer, float t) {
-    apply_temperature(*answer, t);
-}
-
-//
-// system_one_answers
-//
-
-system_one_answers * system_one_answers_init(void) {
-    return new system_one_answers();
-}
-
-void system_one_answers_free(system_one_answers * answers) {
-    delete answers;
-}
-
-size_t system_one_answers_size(const system_one_answers * answers) {
-    return answers->entries.size();
-}
-
-const system_one_answer * system_one_answers_get(const system_one_answers * answers, size_t i) {
-    return i < answers->entries.size() ? &answers->entries[i] : nullptr;
-}
-
-void system_one_answers_add(system_one_answers * answers, system_one_answer * answer) {
-    if (answer == nullptr) {
-        return;
-    }
-    // ownership is taken either way: a caller that has handed the answer over must not be left
-    // holding a pointer it no longer believes it owns
-    if (answers != nullptr) {
-        answers->entries.push_back(std::move(*answer));
-    }
-    delete answer;
-}
-
-void system_one_answers_apply_temperature(system_one_answers * answers, float t) {
-    if (answers == nullptr) {
-        return;
-    }
-    for (auto & a : answers->entries) {
-        apply_temperature(a, t);
-    }
-}
-
-int32_t system_one_answers_from_logits(const system_one_plan * plan,
-                                       const float * const * rows, size_t n_rows,
-                                       system_one_answers * out) {
-    if (plan == nullptr || out == nullptr || (rows == nullptr && n_rows > 0)) {
-        log_err("no plan, no logit rows or no output");
-        return 1;
-    }
-    if (plan->rank_pooling) {
-        log_err("this readout is scored by the model's head, not read at a slot -- "
-                              "use system_one_answers_from_scores()");
-        return 1;
-    }
-    if (n_rows != plan->n_options.size()) {
-        log_err("got " + std::to_string(n_rows) + " logit rows for " +
-                              std::to_string(plan->n_options.size()) + " questions");
-        return 1;
-    }
-
-    out->entries.clear();
-    out->entries.reserve(n_rows);
-    for (size_t qi = 0; qi < n_rows; qi++) {
-        if (rows[qi] == nullptr) {
-            log_err("no logits for question " + std::to_string(qi));
-            return 1;
-        }
-        out->entries.push_back(answer_from_logits(rows[qi], plan->labels, plan->n_options[qi]));
-    }
-    return 0;
-}
-
-int32_t system_one_answers_from_scores(const system_one_plan * plan,
-                                       const float * scores, size_t n_scores,
-                                       system_one_answers * out) {
-    if (plan == nullptr || out == nullptr || (scores == nullptr && n_scores > 0)) {
-        log_err("no plan, no scores or no output");
-        return 1;
-    }
-
-    out->entries.clear();
-
-    std::string msg;
-    if (!answers_from_scores(*plan, std::vector<float>(scores, scores + n_scores), out->entries, msg)) {
-        log_err(msg);
-        return 1;
-    }
-    return 0;
-}
-
-int32_t system_one_label_tokens(const llama_vocab * vocab,
-                                const char * const * labels, size_t n_labels,
-                                llama_token * out) {
-    if (vocab == nullptr || labels == nullptr || out == nullptr) {
-        log_err("no vocab, no labels or no output");
-        return 1;
-    }
-
-    std::vector<std::string> names;
-    names.reserve(n_labels);
-    for (size_t i = 0; i < n_labels; i++) {
-        names.push_back(labels[i] ? labels[i] : "");
-    }
-
-    std::vector<llama_token> ids;
-    std::string bad;
-    if (!label_tokens(vocab, names, ids, &bad)) {
-        log_err("the answer label \"" + bad + "\" is not a single token for this tokenizer");
-        return 1;
-    }
-
-    for (size_t i = 0; i < ids.size() && i < n_labels; i++) {
-        out[i] = ids[i];
-    }
-    return 0;
-}

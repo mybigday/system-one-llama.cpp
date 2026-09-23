@@ -484,13 +484,11 @@ struct server_task_result_embd : server_task_result {
     json to_json_oaicompat();
 };
 
-// One typed decision per question: the label logits, and the probabilities over them.
-// The route builds the Jev-shaped response from these, since it holds the request.
+// One typed decision per question. The route builds the Jev-shaped response from these, since
+// it holds the request -- but it is handed the answers themselves rather than their fields
+// taken apart, because putting them back together would be the same softmax twice.
 struct server_task_result_system_one : server_task_result {
-    // The answers themselves, in question order -- not their fields copied out. An answer is
-    // the library's object; taking it apart here and putting it back together in the route
-    // would be the same softmax twice.
-    system_one::answers_ptr answers;
+    std::vector<system_one_answer> answers;   // in question order
 
     int32_t n_tokens = 0;
     int32_t n_cached = 0;   // prompt tokens served from the KV cache

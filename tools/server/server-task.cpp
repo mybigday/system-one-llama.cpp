@@ -1502,13 +1502,12 @@ json server_task_result_system_one::to_json() {
     // a flat debug view; the route reshapes this into the Jev answers object, because it
     // is the route that knows the question keys, kinds and criteria
     json out = json::array();
-    for (size_t i = 0; i < system_one_answers_size(answers.get()); i++) {
-        const system_one_answer * a = system_one_answers_get(answers.get(), i);
+    for (const auto & a : answers) {
         out.push_back(json {
-            {"choice",      system_one_answer_get_choice(a)},
-            {"confidence",  system_one_answer_get_confidence(a)},
-            {"probs",       system_one::probs_of(a)},
-            {"logits",      system_one::logits_of(a)},
+            {"choice",      a.choice},
+            {"confidence",  a.confidence},
+            {"probs",       a.probs},
+            {"logits",      a.logits},
         });
     }
     return json {

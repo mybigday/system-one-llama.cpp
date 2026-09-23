@@ -41,10 +41,7 @@ a System One template is rendered with a state, questions and option labels, nev
 message list, which is why it does not reuse `--chat-template-file`.
 
 `llama-server` exposes the same thing over HTTP as `POST /v1/systemone`. Both are adapters
-over the `system-one` library in this directory -- a C API, `extern "C"` like `mtmd.h`, with
-opaque handles, pointer-plus-count reads and a caller buffer for the error text; the C++
-wrappers at the bottom of the header are what the in-tree callers use. `tests/test-system-one-c-api.c`
-is a `.c` file on purpose: it is what says the header is still C. The library owns every decision that depends on
+over the `system-one` library in this directory, which owns every decision that depends on
 the readout -- how many sequences to run, which tokens carry the answer, where the answer
 sits -- so the two front ends cannot drift apart. `--system-one-request` takes the server's
 request body verbatim, which is the way to check one against the other.
