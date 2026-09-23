@@ -340,6 +340,12 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
+# libsystem-one -- this one is .c on purpose: it is what says the header is still a C header
+set(LLAMA_TEST_NAME test-system-one-c-api)
+llama_build_and_test(test-system-one-c-api.c)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE system-one)
+unset(LLAMA_TEST_NAME)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

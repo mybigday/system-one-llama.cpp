@@ -87,7 +87,7 @@ static void parse_options(const std::string & rest, bool with_descs,
 // The flags and the JSON body describe the same thing; both land here.
 static bool collect_questions(const common_params & params,
                               std::vector<std::string> & keys,
-                              std::vector<system_one_question> & qs,
+                              system_one::question_list & qs,
                               std::string & state,
                               std::vector<std::string> & cfg_labels,
                               float & temperature,
@@ -133,7 +133,7 @@ static bool collect_questions(const common_params & params,
             }
 
             const std::string type = q.value("type", "noul");
-            system_one_question out;
+            system_one::question out;
             out.text = q.value("instructions", "");
             if (type == "noul") {
                 out.kind = SYSTEM_ONE_KIND_NOUL;
@@ -159,7 +159,7 @@ static bool collect_questions(const common_params & params,
                 return false;
             }
             keys.push_back(item.key());
-            qs.push_back(std::move(out));
+            qs.entries.push_back(std::move(out));
         }
         return true;
     }
@@ -167,11 +167,11 @@ static bool collect_questions(const common_params & params,
     for (const auto & spec : params.so_noul) {
         std::string key, instr, rest;
         if (!split_spec(spec, key, instr, rest)) { err = "--noul wants KEY:INSTRUCTIONS"; return false; }
-        system_one_question q;
+        system_one::question q;
         q.kind = SYSTEM_ONE_KIND_NOUL;
         q.text = instr;
         keys.push_back(key);
-        qs.push_back(std::move(q));
+        qs.entries.push_back(std::move(q));
     }
     for (const auto & spec : params.so_choice) {
         std::string key, instr, rest;
@@ -179,12 +179,12 @@ static bool collect_questions(const common_params & params,
             err = "--choice wants KEY:INSTRUCTIONS:opt[=desc][,opt[=desc]...]";
             return false;
         }
-        system_one_question q;
+        system_one::question q;
         q.kind = SYSTEM_ONE_KIND_CHOICE;
         q.text = instr;
         parse_options(rest, true, q.options, q.descs);
         keys.push_back(key);
-        qs.push_back(std::move(q));
+        qs.entries.push_back(std::move(q));
     }
     for (const auto & spec : params.so_score) {
         std::string key, instr, rest;
@@ -192,12 +192,12 @@ static bool collect_questions(const common_params & params,
             err = "--score wants KEY:INSTRUCTIONS:level[,level...]";
             return false;
         }
-        system_one_question q;
+        system_one::question q;
         q.kind = SYSTEM_ONE_KIND_SCORE;
         q.text = instr;
         parse_options(rest, false, q.options, q.descs);
         keys.push_back(key);
-        qs.push_back(std::move(q));
+        qs.entries.push_back(std::move(q));
     }
     return true;
 }
@@ -206,22 +206,44 @@ static bool collect_questions(const common_params & params,
 // reads the output, the same split common/chat.h has. The server drives the same plan through
 // its scheduler instead; neither is more correct, they just own different batching.
 
-// The slot readouts: one decode over the whole sequence, logits asked for at the answer slots.
-static bool decode_slots(llama_context * ctx, const system_one_plan & p,
-                         std::vector<system_one_answer> & out, std::string & err) {
-    const auto & t = p.sequences.front().tok;
+// The plan owns its tokens and hands them out as pointer plus count, which every loop below
+// wants as one value.
+struct seq_view {
+    const llama_token * ids     = nullptr;
+    size_t              n_ids   = 0;
+    const int32_t *     slots   = nullptr;
+    size_t              n_slots = 0;
+    size_t              n_shared = 0;
+};
 
-    llama_batch batch = llama_batch_init((int32_t) t.ids.size(), 0, 1);
-    batch.n_tokens = (int32_t) t.ids.size();
-    for (size_t i = 0; i < t.ids.size(); i++) {
+static seq_view view_of(const system_one_plan * p, size_t i) {
+    const system_one_sequence  * seq = system_one_plan_get_sequence(p, i);
+    const system_one_tokenized * tok = system_one_sequence_get_tokenized(seq);
+
+    seq_view v;
+    v.ids      = system_one_tokenized_get_tokens(tok, &v.n_ids);
+    v.slots    = system_one_tokenized_get_slots (tok, &v.n_slots);
+    v.n_shared = system_one_sequence_get_n_shared(seq);
+    return v;
+}
+
+// The slot readouts: one decode over the whole sequence, logits asked for at the answer slots.
+static bool decode_slots(llama_context * ctx, const system_one_plan * p,
+                         system_one_answers * out, std::string & err) {
+    const seq_view t = view_of(p, 0);
+
+    llama_batch batch = llama_batch_init((int32_t) t.n_ids, 0, 1);
+    batch.n_tokens = (int32_t) t.n_ids;
+    for (size_t i = 0; i < t.n_ids; i++) {
         batch.token[i]     = t.ids[i];
         batch.pos[i]       = (llama_pos) i;
         batch.n_seq_id[i]  = 1;
         batch.seq_id[i][0] = 0;
         batch.logits[i]    = 0;
     }
-    for (int slot : t.slots) {
-        if (slot < 0 || slot >= (int) t.ids.size()) {
+    for (size_t i = 0; i < t.n_slots; i++) {
+        const int32_t slot = t.slots[i];
+        if (slot < 0 || slot >= (int32_t) t.n_ids) {
             llama_batch_free(batch);
             err = "answer slot outside the sequence";
             return false;
@@ -236,14 +258,22 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
         return false;
     }
 
-    out.clear();
-    for (size_t qi = 0; qi < t.slots.size(); qi++) {
+    size_t n_labels = 0;
+    const llama_token * labels = system_one_plan_get_labels(p, &n_labels);
+
+    for (size_t qi = 0; qi < t.n_slots; qi++) {
         const float * row = llama_get_logits_ith(ctx, t.slots[qi]);
         if (row == nullptr) {
             err = "no logits at answer slot " + std::to_string(qi);
             return false;
         }
-        out.push_back(system_one_answer_from_logits(row, p.labels, p.n_options[qi]));
+        system_one_answer * a =
+            system_one_answer_init_from_logits(row, labels, n_labels, system_one_plan_get_n_options(p, qi));
+        if (a == nullptr) {
+            err = "could not read the answer at slot " + std::to_string(qi);
+            return false;
+        }
+        system_one_answers_add(out, a);
     }
     return true;
 }
@@ -256,18 +286,19 @@ static bool decode_slots(llama_context * ctx, const system_one_plan & p,
 // When the plan says the sequences may share their prefix -- the state and the question, which
 // only a causal model can share because a bidirectional one recomputes them from what follows
 // -- the head is decoded once and its KV copied, so the state costs one pass instead of K.
-static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
-                          std::vector<system_one_answer> & out, std::string & err) {
-    const uint32_t n_ubatch  = llama_n_ubatch(ctx);
-    const uint32_t n_seq_max = llama_n_seq_max(ctx);
+static bool decode_ranked(llama_context * ctx, const system_one_plan * p,
+                          system_one_answers * out, std::string & err) {
+    const uint32_t n_ubatch     = llama_n_ubatch(ctx);
+    const uint32_t n_seq_max    = llama_n_seq_max(ctx);
+    const size_t   n_sequences  = system_one_plan_get_n_sequences(p);
 
-    std::vector<float> scores(p.sequences.size(), 0.0f);
+    std::vector<float> scores(n_sequences, 0.0f);
 
-    for (size_t i = 0; i < p.sequences.size(); ) {
+    for (size_t i = 0; i < n_sequences; ) {
         size_t n_seq = 0;
         size_t n_tok = 0;
-        while (i + n_seq < p.sequences.size() && n_seq < n_seq_max) {
-            const size_t len = p.sequences[i + n_seq].tok.ids.size();
+        while (i + n_seq < n_sequences && n_seq < n_seq_max) {
+            const size_t len = view_of(p, i + n_seq).n_ids;
             if (len > n_ubatch) {
                 err = "one option sequence is " + std::to_string(len) +
                       " tokens, more than the micro-batch (" + std::to_string(n_ubatch) + ") -- raise -ub";
@@ -283,18 +314,18 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         // the prefix every sequence in this chunk agrees on, if sharing is allowed at all
         size_t n_prefix = 0;
         if (n_seq > 1) {
-            n_prefix = p.sequences[i + 1].n_shared;
+            n_prefix = view_of(p, i + 1).n_shared;
             for (size_t k = 2; k < n_seq; k++) {
-                n_prefix = std::min(n_prefix, p.sequences[i + k].n_shared);
+                n_prefix = std::min(n_prefix, view_of(p, i + k).n_shared);
             }
             // only worth a decode of its own if it is most of the work
-            if (n_prefix * 2 < p.sequences[i].tok.ids.size()) {
+            if (n_prefix * 2 < view_of(p, i).n_ids) {
                 n_prefix = 0;
             }
         }
 
         if (n_prefix > 0) {
-            const auto & ids = p.sequences[i].tok.ids;
+            const llama_token * ids = view_of(p, i).ids;
             llama_batch pre = llama_batch_init((int32_t) n_prefix, 0, 1);
             pre.n_tokens = (int32_t) n_prefix;
             for (size_t j = 0; j < n_prefix; j++) {
@@ -318,8 +349,9 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         llama_batch batch = llama_batch_init((int32_t) n_tok, 0, (int32_t) n_seq);
         batch.n_tokens = 0;
         for (size_t k = 0; k < n_seq; k++) {
-            const auto & ids = p.sequences[i + k].tok.ids;
-            for (size_t j = n_prefix; j < ids.size(); j++) {
+            const seq_view v = view_of(p, i + k);
+            const llama_token * ids = v.ids;
+            for (size_t j = n_prefix; j < v.n_ids; j++) {
                 const int32_t at = batch.n_tokens++;
                 batch.token[at]     = ids[j];
                 batch.pos[at]       = (llama_pos) j;
@@ -347,7 +379,12 @@ static bool decode_ranked(llama_context * ctx, const system_one_plan & p,
         i += n_seq;
     }
 
-    return system_one_answers_from_scores(p, scores, out, err);
+    system_one::error_buffer eb;
+    if (system_one_answers_from_scores(p, scores.data(), scores.size(), out, eb.data(), eb.size()) != 0) {
+        err = eb.str();
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -370,19 +407,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    system_one_params cfg;
     std::string err;
-    if (!system_one_params_from_model(model, cfg, err)) {
-        LOG_ERR("%s: %s\n", __func__, err.c_str());
+    system_one::error_buffer eb;
+    system_one::params_ptr cfg(system_one_params_init_from_model(model, eb.data(), eb.size()));
+    if (!cfg) {
+        LOG_ERR("%s: %s\n", __func__, eb.str().c_str());
         llama_model_free(model);
         return 1;
     }
     if (!params.so_template_file.empty()) {
-        if (!read_file(params.so_template_file, cfg.template_src)) {
+        std::string tmpl;
+        if (!read_file(params.so_template_file, tmpl)) {
             LOG_ERR("%s: cannot read template %s\n", __func__, params.so_template_file.c_str());
             llama_model_free(model);
             return 1;
         }
+        system_one_params_set_template(cfg.get(), tmpl.c_str());
     }
 
     std::string state = params.so_state;
@@ -392,8 +432,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<std::string>           keys;
-    std::vector<system_one_question>  qs;
+    std::vector<std::string>  keys;
+    system_one::question_list qs;
     std::vector<std::string> req_labels;
     float                    req_temperature = 1.0f;
     if (!collect_questions(params, keys, qs, state, req_labels, req_temperature, err)) {
@@ -401,33 +441,37 @@ int main(int argc, char ** argv) {
         llama_model_free(model);
         return 1;
     }
-    if (qs.empty()) {
+    if (qs.size() == 0) {
         LOG_ERR("%s: no questions -- pass --noul / --choice / --score, or --system-one-request FILE\n", __func__);
         llama_model_free(model);
         return 1;
     }
 
-    system_one_plan plan;
     if (!params.so_labels.empty()) {
         req_labels = string_split<std::string>(params.so_labels, ',');
     }
     if (!req_labels.empty()) {
         // the labels say where an answer is read, so a format written by an overridden
         // template has to be able to name them too
-        cfg.labels             = req_labels;
-        cfg.labels_are_default = false;
+        std::vector<const char *> label_ptrs;
+        label_ptrs.reserve(req_labels.size());
+        for (const auto & l : req_labels) label_ptrs.push_back(l.c_str());
+        system_one_params_set_labels(cfg.get(), label_ptrs.data(), label_ptrs.size());
     }
 
-    if (!system_one_build_plan(cfg, llama_model_get_vocab(model), state, qs, plan, err) ||
-        !system_one_tokenize_plan(llama_model_get_vocab(model), cfg, plan, err)) {
-        LOG_ERR("%s: %s\n", __func__, err.c_str());
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    system_one::plan_ptr plan(system_one_plan_init(cfg.get(), vocab, state.c_str(),
+                                                   qs.c_ptr(), qs.size(), eb.data(), eb.size()));
+    if (!plan || system_one_plan_tokenize(plan.get(), vocab, cfg.get(), eb.data(), eb.size()) != 0) {
+        LOG_ERR("%s: %s\n", __func__, eb.str().c_str());
         llama_model_free(model);
         return 1;
     }
 
     // What the checkpoint's readout needs of the context, applied here rather than by the
     // library, so every value the context is built with is visible at this one place.
-    const system_one_context_needs need = system_one_required_context(cfg);
+    const system_one_context_needs need = system_one_params_get_context_needs(cfg.get());
 
     if (need.embeddings) {
         params.embedding = true;
@@ -439,13 +483,14 @@ int main(int argc, char ** argv) {
     // How big to make the context is this tool's call, not the library's. Scoring one sequence
     // per option wants them in one decode; this many at a time is enough to matter without a
     // 255-option question demanding a 255-sequence micro-batch.
-    const size_t n_seq = std::min<size_t>(plan.sequences.size(), MAX_BATCHED_SEQS);
+    const size_t n_seq = std::min<size_t>(system_one_plan_get_n_sequences(plan.get()), MAX_BATCHED_SEQS);
     if (n_seq > 1) {
         size_t n_tok = 0;
         bool   share = false;
         for (size_t i = 0; i < n_seq; i++) {
-            n_tok += plan.sequences[i].tok.ids.size();
-            share  = share || plan.sequences[i].n_shared > 0;
+            const seq_view v = view_of(plan.get(), i);
+            n_tok += v.n_ids;
+            share  = share || v.n_shared > 0;
         }
         if (share) {
             // sharing copies a range of one sequence's KV to the others, and a partial
@@ -466,9 +511,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<system_one_answer> answers;
-    const bool ok = plan.rank_pooling ? decode_ranked(ctx, plan, answers, err)
-                                      : decode_slots (ctx, plan, answers, err);
+    system_one::answers_ptr answers(system_one_answers_init());
+    const bool ok = system_one_plan_get_rank_pooling(plan.get())
+                        ? decode_ranked(ctx, plan.get(), answers.get(), err)
+                        : decode_slots (ctx, plan.get(), answers.get(), err);
     if (!ok) {
         LOG_ERR("%s: %s\n", __func__, err.c_str());
         llama_free(ctx); llama_model_free(model);
@@ -478,39 +524,45 @@ int main(int argc, char ** argv) {
     // A caller recalibrating on its own distribution can scale the answers; T = 1, the common
     // case, costs nothing. The model's own T is already folded into its weights.
     const float t = params.so_temperature > 0.0f ? params.so_temperature : req_temperature;
-    for (auto & a : answers) {
-        system_one_apply_temperature(a, t);
+    for (size_t qi = 0; qi < system_one_answers_size(answers.get()); qi++) {
+        // the list owns its entries; rescaling one is a write, which is why the const comes off
+        system_one_answer_apply_temperature(
+            const_cast<system_one_answer *>(system_one_answers_get(answers.get(), qi)), t);
     }
 
     // One rendering loop for every readout: the answers arrived in request order either way.
     json out_answers;
     int32_t n_tokens = 0;
-    for (const auto & s : plan.sequences) n_tokens += (int32_t) s.tok.ids.size();
+    for (size_t i = 0; i < system_one_plan_get_n_sequences(plan.get()); i++) {
+        n_tokens += (int32_t) view_of(plan.get(), i).n_ids;
+    }
 
     for (size_t qi = 0; qi < qs.size(); qi++) {
-        const auto & a = answers[qi];
-        const auto & q = qs[qi];
+        const system_one_answer  * a = system_one_answers_get(answers.get(), qi);
+        const system_one::question & q = qs.entries[qi];
+        const std::vector<float> probs = system_one::probs_of(a);
+        const int32_t choice = system_one_answer_get_choice(a);
         json ja;
         switch (q.kind) {
             case SYSTEM_ONE_KIND_NOUL:
-                ja["noul"] = a.probs.size() > 1 ? a.probs[1] : 0.0f;
+                ja["noul"] = probs.size() > 1 ? probs[1] : 0.0f;
                 break;
             case SYSTEM_ONE_KIND_CHOICE: {
-                ja["choice"] = q.options[a.choice];
-                json probs;
-                for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
-                    probs[q.options[i]] = a.probs[i];
+                ja["choice"] = q.options[choice];
+                json per_option;
+                for (size_t i = 0; i < q.options.size() && i < probs.size(); i++) {
+                    per_option[q.options[i]] = probs[i];
                 }
-                ja["probabilities"] = probs;
+                ja["probabilities"] = per_option;
             } break;
             case SYSTEM_ONE_KIND_SCORE:
-                ja["score"]         = system_one_score_expectation(a);
+                ja["score"]         = system_one_answer_get_score_expectation(a);
                 ja["legend"]        = q.options;
-                ja["probabilities"] = a.probs;
+                ja["probabilities"] = probs;
                 break;
         }
-        ja["confidence"] = a.confidence;
-        ja["logits"]     = a.logits;
+        ja["confidence"] = system_one_answer_get_confidence(a);
+        ja["logits"]     = system_one::logits_of(a);   // always returned: calibration is the caller's business
         out_answers[keys[qi]] = ja;
     }
 
@@ -521,36 +573,39 @@ int main(int argc, char ** argv) {
         res["usage"]   = json{
             {"input_tokens",  n_tokens},
             {"output_tokens", 0},
-            {"sequences",     (int) plan.sequences.size()},
+            {"sequences",     (int) system_one_plan_get_n_sequences(plan.get())},
         };
         LOG("%s\n", res.dump(2).c_str());
     } else {
         for (size_t qi = 0; qi < qs.size(); qi++) {
-            const auto & a = answers[qi];
-            const auto & q = qs[qi];
+            const system_one_answer  * a = system_one_answers_get(answers.get(), qi);
+            const system_one::question & q = qs.entries[qi];
+            const std::vector<float> probs = system_one::probs_of(a);
             LOG("\n%s  (%s, confidence %.3f)\n", keys[qi].c_str(),
                 q.kind == SYSTEM_ONE_KIND_NOUL   ? "noul"   :
-                q.kind == SYSTEM_ONE_KIND_CHOICE ? "choice" : "score", a.confidence);
+                q.kind == SYSTEM_ONE_KIND_CHOICE ? "choice" : "score",
+                system_one_answer_get_confidence(a));
             switch (q.kind) {
                 case SYSTEM_ONE_KIND_NOUL:
-                    LOG("  P(true) = %.4f\n", a.probs.size() > 1 ? a.probs[1] : 0.0f);
+                    LOG("  P(true) = %.4f\n", probs.size() > 1 ? probs[1] : 0.0f);
                     break;
                 case SYSTEM_ONE_KIND_CHOICE:
-                    LOG("  -> %s\n", q.options[a.choice].c_str());
-                    for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
-                        LOG("     %-24s %.4f\n", q.options[i].c_str(), a.probs[i]);
+                    LOG("  -> %s\n", q.options[system_one_answer_get_choice(a)].c_str());
+                    for (size_t i = 0; i < q.options.size() && i < probs.size(); i++) {
+                        LOG("     %-24s %.4f\n", q.options[i].c_str(), probs[i]);
                     }
                     break;
                 case SYSTEM_ONE_KIND_SCORE:
-                    LOG("  score = %.4f over %zu levels\n", system_one_score_expectation(a), q.options.size());
-                    for (size_t i = 0; i < q.options.size() && i < a.probs.size(); i++) {
-                        LOG("     %-24s %.4f\n", q.options[i].c_str(), a.probs[i]);
+                    LOG("  score = %.4f over %zu levels\n",
+                        system_one_answer_get_score_expectation(a), q.options.size());
+                    for (size_t i = 0; i < q.options.size() && i < probs.size(); i++) {
+                        LOG("     %-24s %.4f\n", q.options[i].c_str(), probs[i]);
                     }
                     break;
             }
         }
         LOG("\n%d prompt tokens, %zu sequence(s), 0 tokens generated\n",
-            n_tokens, plan.sequences.size());
+            n_tokens, system_one_plan_get_n_sequences(plan.get()));
     }
 
     llama_free(ctx);

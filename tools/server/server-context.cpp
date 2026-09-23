@@ -276,7 +276,7 @@ struct server_slot {
     // sit inside the prompt, so they can be decoded in an earlier sub-batch than the one
     // that finishes the prompt -- hence collecting as we go instead of reading at the end.
     std::vector<std::pair<int32_t, int32_t>> so_outputs;
-    std::vector<system_one_answer>          so_answers;
+    std::vector<system_one::answer_ptr>     so_answers;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -2228,16 +2228,16 @@ private:
 
         const size_t n_questions = slot.task->system_one.slots.size();
         for (size_t qi = 0; qi < n_questions; qi++) {
-            if (qi >= slot.so_answers.size() || slot.so_answers[qi].probs.empty()) {
+            if (qi >= slot.so_answers.size() || !slot.so_answers[qi]) {
                 SLT_ERR(slot, "no answer collected for question %zu\n", qi);
                 send_error(slot, "System One: an answer slot was never decoded", ERROR_TYPE_SERVER);
                 return;
             }
-            const auto & a = slot.so_answers[qi];
-            res->logits.push_back(a.logits);
-            res->probs.push_back(a.probs);
-            res->choice.push_back(a.choice);
-            res->confidence.push_back(a.confidence);
+            const system_one_answer * a = slot.so_answers[qi].get();
+            res->logits.push_back(system_one::logits_of(a));
+            res->probs.push_back(system_one::probs_of(a));
+            res->choice.push_back(system_one_answer_get_choice(a));
+            res->confidence.push_back(system_one_answer_get_confidence(a));
         }
 
         SLT_DBG(slot, "sending System One result for %zu question(s)\n", n_questions);
@@ -3922,10 +3922,11 @@ private:
             if (slot.task && slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.so_outputs.empty()) {
                 const auto & so = slot.task->system_one;
                 if (slot.so_answers.size() != so.slots.size()) {
-                    slot.so_answers.assign(so.slots.size(), system_one_answer{});
+                    slot.so_answers.clear();
+                    slot.so_answers.resize(so.slots.size());
                 }
                 for (const auto & [idx, qi] : slot.so_outputs) {
-                    if (!is_inside_view(idx) || !slot.so_answers[qi].probs.empty()) {
+                    if (!is_inside_view(idx) || slot.so_answers[qi]) {
                         continue;
                     }
                     const float * row = llama_get_logits_ith(ctx_tgt, idx - off);
@@ -3933,7 +3934,8 @@ private:
                         SLT_ERR(slot, "failed to get logits for answer slot %d\n", idx);
                         continue;
                     }
-                    slot.so_answers[qi] = system_one_answer_from_logits(row, so.letters, so.n_options[qi]);
+                    slot.so_answers[qi].reset(system_one_answer_init_from_logits(
+                        row, so.letters.data(), so.letters.size(), so.n_options[qi]));
                 }
             }
 
@@ -5375,17 +5377,18 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         const bool has_tmpl_override = body.contains("template") && body.at("template").is_string();
 
-        system_one_params cfg;
         std::string err;
-        if (!system_one_params_from_model(ctx_server.model_tgt, cfg, err)) {
+        system_one::error_buffer eb;
+        system_one::params_ptr cfg(system_one_params_init_from_model(ctx_server.model_tgt, eb.data(), eb.size()));
+        if (!cfg) {
             if (!has_tmpl_override) {
-                res->error(format_error_response(err, ERROR_TYPE_NOT_SUPPORTED));
+                res->error(format_error_response(eb.str(), ERROR_TYPE_NOT_SUPPORTED));
                 return res;
             }
-            cfg = system_one_params();
+            cfg.reset(system_one_params_init());
         }
         if (has_tmpl_override) {
-            cfg.template_src = body.at("template").get<std::string>();
+            system_one_params_set_template(cfg.get(), body.at("template").get<std::string>().c_str());
         }
 
         // A template override without its labels would be answered at the wrong tokens: the
@@ -5396,13 +5399,17 @@ void server_routes::init_routes() {
                 res->error(format_error_response("\"labels\" must be a non-empty array of strings", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
+            std::vector<std::string> labels;
             try {
-                cfg.labels = body.at("labels").get<std::vector<std::string>>();
+                labels = body.at("labels").get<std::vector<std::string>>();
             } catch (const std::exception &) {
                 res->error(format_error_response("\"labels\" must be an array of strings", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            cfg.labels_are_default = false;
+            std::vector<const char *> ptrs;
+            ptrs.reserve(labels.size());
+            for (const auto & l : labels) ptrs.push_back(l.c_str());
+            system_one_params_set_labels(cfg.get(), ptrs.data(), ptrs.size());
         }
 
         if (!body.contains("questions") || !body.at("questions").is_object()) {
@@ -5468,7 +5475,7 @@ const json & st = body.at("state");
         std::vector<std::string>              keys;
         std::vector<std::string>              kinds;
         std::vector<std::vector<std::string>> options;
-        std::vector<system_one_question>     questions;
+        system_one::question_list             questions;
 
         // one temperature for the request, because calibration is a property of the
         // deployment rather than of a question: a caller fits it on its own distribution
@@ -5489,7 +5496,7 @@ const json & st = body.at("state");
             }
 
             const std::string type = json_value(q, "type", std::string("noul"));
-            system_one_question out;
+            system_one::question out;
             out.text = json_value(q, "instructions", std::string());
 
             if (type == "noul") {
@@ -5528,10 +5535,10 @@ const json & st = body.at("state");
             keys.push_back(key);
             kinds.push_back(type);
             options.push_back(out.options);
-            questions.push_back(std::move(out));
+            questions.entries.push_back(std::move(out));
         }
 
-        if (questions.empty()) {
+        if (questions.size() == 0) {
             res->error(format_error_response("\"questions\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -5544,12 +5551,14 @@ const json & st = body.at("state");
         std::vector<int> media_slots;
 
         if (!state_files.empty()) {
-            system_one_plan lay;
-            if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, lay, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            system_one::plan_ptr lay(system_one_plan_init(cfg.get(), ctx_server.vocab, state.c_str(),
+                                                          questions.c_ptr(), questions.size(),
+                                                          eb.data(), eb.size()));
+            if (!lay) {
+                res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            if (lay.rank_pooling) {
+            if (system_one_plan_get_rank_pooling(lay.get())) {
                 res->error(format_error_response(
                     "media in \"state\" is not supported for a classification-head model: each option "
                     "is its own sequence, so the media would be encoded once per option",
@@ -5557,9 +5566,10 @@ const json & st = body.at("state");
                 return res;
             }
 
-            const auto & ls = lay.sequences.front();
-            const size_t first_question = ls.segments.size() - ls.n_question_segments;
-            const std::string marker = get_media_marker();
+            const system_one_sequence * ls = system_one_plan_get_sequence(lay.get(), 0);
+            const size_t n_segments     = system_one_sequence_get_n_segments(ls);
+            const size_t first_question = n_segments - system_one_sequence_get_n_question_segments(ls);
+            const std::string marker    = get_media_marker();
 
             media_tokens = server_tokens({}, true);
 
@@ -5568,7 +5578,7 @@ const json & st = body.at("state");
             // and each gets exactly the media its own markers call for.
             size_t next_file = 0;
             for (size_t i = 0; i < first_question; i++) {
-                const std::string & seg = ls.segments[i];
+                const std::string seg = system_one_sequence_get_segment(ls, i);
 
                 size_t n_markers = 0;
                 for (size_t at = seg.find(marker); at != std::string::npos; at = seg.find(marker, at + marker.size())) {
@@ -5596,28 +5606,37 @@ const json & st = body.at("state");
                 return res;
             }
 
-            const std::vector<std::string> q_segments(ls.segments.begin() + first_question, ls.segments.end());
-            std::vector<llama_token> q_ids;
-            if (!system_one_resolve_question_slots(ctx_server.vocab, cfg, q_segments,
-                                                    media_tokens.size(), q_ids, media_slots, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+            std::vector<const char *> q_segments;
+            for (size_t i = first_question; i < n_segments; i++) {
+                q_segments.push_back(system_one_sequence_get_segment(ls, i));
+            }
+
+            system_one::tokenized_ptr q_tok(system_one_tokenized_init());
+            if (system_one_resolve_question_slots(ctx_server.vocab, cfg.get(),
+                                                  q_segments.data(), q_segments.size(),
+                                                  media_tokens.size(), q_tok.get(),
+                                                  eb.data(), eb.size()) != 0) {
+                res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            media_tokens.insert(q_ids);
+            media_slots = system_one::slots_of(q_tok.get());
+            media_tokens.insert(system_one::tokens_of(q_tok.get()));
         }
 
-        system_one_plan plan;
-        if (!system_one_build_plan(cfg, ctx_server.vocab, state, questions, plan, err) ||
-            !system_one_tokenize_plan(ctx_server.vocab, cfg, plan, err)) {
-            res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+        system_one::plan_ptr plan(system_one_plan_init(cfg.get(), ctx_server.vocab, state.c_str(),
+                                                       questions.c_ptr(), questions.size(),
+                                                       eb.data(), eb.size()));
+        if (!plan || system_one_plan_tokenize(plan.get(), ctx_server.vocab, cfg.get(),
+                                              eb.data(), eb.size()) != 0) {
+            res->error(format_error_response(eb.str(), ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 
-        std::vector<system_one_answer> answers;
+        system_one::answers_ptr answers(system_one_answers_init());
         int32_t n_tokens_in = 0;
         int32_t n_cached    = 0;   // stays 0 where the readout cannot reuse a prefix
 
-        if (plan.rank_pooling) {
+        if (system_one_plan_get_rank_pooling(plan.get())) {
             // Sequence-level scores come from the model's classification head, which is what a
             // rerank task already computes -- one task per planned sequence, no new machinery.
             if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
@@ -5630,12 +5649,16 @@ const json & st = body.at("state");
             auto & rd_rank = res->rd;
             {
                 std::vector<server_task> tasks;
-                tasks.reserve(plan.sequences.size());
-                for (size_t i = 0; i < plan.sequences.size(); i++) {
+                const size_t n_sequences = system_one_plan_get_n_sequences(plan.get());
+                tasks.reserve(n_sequences);
+                for (size_t i = 0; i < n_sequences; i++) {
+                    const system_one_tokenized * tok =
+                        system_one_sequence_get_tokenized(system_one_plan_get_sequence(plan.get(), i));
+
                     server_task task(SERVER_TASK_TYPE_RERANK);
                     task.id     = rd_rank.get_new_id();
                     task.index  = i;
-                    task.tokens = server_tokens(plan.sequences[i].tok.ids, false);
+                    task.tokens = server_tokens(system_one::tokens_of(tok), false);
                     tasks.push_back(std::move(task));
                 }
                 rd_rank.post_tasks(std::move(tasks));
@@ -5645,7 +5668,7 @@ const json & st = body.at("state");
             if (all.is_terminated) return res;
             if (all.error) { res->error(all.error->to_json()); return res; }
 
-            std::vector<float> scores(plan.sequences.size(), 0.0f);
+            std::vector<float> scores(system_one_plan_get_n_sequences(plan.get()), 0.0f);
             for (auto & one : all.results) {
                 auto * rr = dynamic_cast<server_task_result_rerank *>(one.get());
                 GGML_ASSERT(rr != nullptr);
@@ -5655,23 +5678,34 @@ const json & st = body.at("state");
                 }
             }
 
-            if (!system_one_answers_from_scores(plan, scores, answers, err)) {
-                res->error(format_error_response(err, ERROR_TYPE_SERVER));
+            if (system_one_answers_from_scores(plan.get(), scores.data(), scores.size(),
+                                               answers.get(), eb.data(), eb.size()) != 0) {
+                res->error(format_error_response(eb.str(), ERROR_TYPE_SERVER));
                 return res;
             }
         } else {
             // One sequence, one decode, the answers read at the slots the plan marked.
-            const auto & seq = plan.sequences.front();
+            const system_one_sequence  * seq = system_one_plan_get_sequence(plan.get(), 0);
+            const system_one_tokenized * tok = system_one_sequence_get_tokenized(seq);
+
+            size_t n_labels = 0;
+            const llama_token * labels = system_one_plan_get_labels(plan.get(), &n_labels);
+
+            std::vector<int32_t> n_options;
+            for (size_t qi = 0; qi < system_one_plan_get_n_questions(plan.get()); qi++) {
+                n_options.push_back(system_one_plan_get_n_options(plan.get(), qi));
+            }
 
             auto & rd_slot = res->rd;
             {
                 server_task task(SERVER_TASK_TYPE_SYSTEM_ONE);
                 task.id     = rd_slot.get_new_id();
-                task.tokens = state_files.empty() ? server_tokens(seq.tok.ids, false) : std::move(media_tokens);
-                task.system_one.slots           = state_files.empty() ? seq.tok.slots : media_slots;
-                task.system_one.letters         = plan.labels;
-                task.system_one.n_options       = plan.n_options;
-                task.system_one.n_reusable      = seq.n_reusable;
+                task.tokens = state_files.empty() ? server_tokens(system_one::tokens_of(tok), false)
+                                                  : std::move(media_tokens);
+                task.system_one.slots           = state_files.empty() ? system_one::slots_of(tok) : media_slots;
+                task.system_one.letters.assign(labels, labels + n_labels);
+                task.system_one.n_options       = n_options;
+                task.system_one.n_reusable      = system_one_sequence_get_n_reusable(seq);
                 rd_slot.post_task(std::move(task));
             }
 
@@ -5682,18 +5716,18 @@ const json & st = body.at("state");
             auto * so_res = dynamic_cast<server_task_result_system_one *>(result.get());
             GGML_ASSERT(so_res != nullptr);
 
-            answers.resize(so_res->probs.size());
-            for (size_t i = 0; i < answers.size(); i++) {
-                answers[i].logits     = so_res->logits[i];
-                answers[i].probs      = so_res->probs[i];
-                answers[i].choice     = so_res->choice[i];
-                answers[i].confidence = so_res->confidence[i];
+            // An answer is entirely determined by its own logits -- probabilities, argmax and
+            // confidence all follow -- so rebuilding it here is the same arithmetic the slot
+            // already did, not a second opinion about it.
+            for (const auto & one_logits : so_res->logits) {
+                system_one_answers_add(answers.get(),
+                    system_one_answer_init_from_scores(one_logits.data(), one_logits.size()));
             }
             n_tokens_in = so_res->n_tokens;
             n_cached    = so_res->n_cached;
             res->rd.stop(); // nothing else to wait for
 
-            if (answers.size() != keys.size()) {
+            if (system_one_answers_size(answers.get()) != keys.size()) {
                 res->error(format_error_response("the readout returned a different number of answers than questions were asked", ERROR_TYPE_SERVER));
                 return res;
             }
@@ -5703,27 +5737,29 @@ const json & st = body.at("state");
         // options, plus the raw numbers the model produced
         json answers_json = json::object();
         for (size_t qi = 0; qi < keys.size(); qi++) {
-            auto a = answers[qi];
+            // the list owns its entries; rescaling one is a write, which is why the const comes
+            // off. The model ships with its own T already folded into the weights, so this only
+            // moves when the caller has recalibrated on a distribution of its own.
+            system_one_answer * a = const_cast<system_one_answer *>(system_one_answers_get(answers.get(), qi));
+            system_one_answer_apply_temperature(a, temperature);
 
-            // the model ships with its own T already folded into the weights, so this only
-            // moves when the caller has recalibrated on a distribution of its own
-            system_one_apply_temperature(a, temperature);
+            const std::vector<float> probs = system_one::probs_of(a);
 
             json one = json::object();
             if (kinds[qi] == "noul") {
-                one["noul"] = a.probs.back();          // P(true): the affirmative side is last
+                one["noul"] = probs.back();            // P(true): the affirmative side is last
             } else if (kinds[qi] == "choice") {
                 json per_option = json::object();
-                for (size_t j = 0; j < options[qi].size(); j++) per_option[options[qi][j]] = a.probs[j];
-                one["choice"]        = options[qi][a.choice];
+                for (size_t j = 0; j < options[qi].size(); j++) per_option[options[qi][j]] = probs[j];
+                one["choice"]        = options[qi][system_one_answer_get_choice(a)];
                 one["probabilities"] = per_option;
             } else {
-                one["score"]         = system_one_score_expectation(a);
+                one["score"]         = system_one_answer_get_score_expectation(a);
                 one["legend"]        = options[qi];
-                one["probabilities"] = a.probs;
+                one["probabilities"] = probs;
             }
-            one["confidence"] = a.confidence;
-            one["logits"]     = a.logits;   // always returned: calibration is the caller's business
+            one["confidence"] = system_one_answer_get_confidence(a);
+            one["logits"]     = system_one::logits_of(a);   // always returned: calibration is the caller's business
             answers_json[keys[qi]] = one;
         }
 
@@ -5731,7 +5767,7 @@ const json & st = body.at("state");
         usage["input_tokens"]  = n_tokens_in;
         usage["output_tokens"] = 0;                        // nothing is generated: that is the point
         usage["cached_tokens"] = n_cached;                      // prefix served from the KV cache
-        usage["sequences"]     = (int) plan.sequences.size();   // > 1 when the readout scores per option
+        usage["sequences"]     = (int) system_one_plan_get_n_sequences(plan.get());  // > 1 when the readout scores per option
 
         json root = json::object();
         root["model"]   = meta->model_name;
