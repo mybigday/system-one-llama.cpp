@@ -27,6 +27,11 @@ static bool meta_str(const llama_model * model, const char * key, std::string & 
     return true;
 }
 
+// -1 when the key is absent; the buffer is optional, so this asks without reading.
+static bool meta_has(const llama_model * model, const char * key) {
+    return llama_model_meta_val_str(model, key, nullptr, 0) >= 0;
+}
+
 static std::vector<std::string> split_array(const std::string & s) {
     // llama.cpp stringifies a kv array as [a, b, c]
     std::vector<std::string> out;
@@ -99,11 +104,10 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     // Only what the checkpoint declares. llama_vocab_bos() falls back to a per-family default
     // when the GGUF carries no id -- 11, a comma, on the BPE path -- and a template asking for
     // this model's BOS would then write that comma into the prompt.
-    std::string unused;
-    if (meta_str(model, "tokenizer.ggml.bos_token_id", unused)) {
+    if (meta_has(model, "tokenizer.ggml.bos_token_id")) {
         out.bos_text = piece(llama_vocab_bos(vocab));
     }
-    if (meta_str(model, "tokenizer.ggml.eos_token_id", unused)) {
+    if (meta_has(model, "tokenizer.ggml.eos_token_id")) {
         out.eos_text = piece(llama_vocab_eos(vocab));
     }
 
