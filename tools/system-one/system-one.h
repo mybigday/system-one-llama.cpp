@@ -61,6 +61,10 @@ struct so_config {
     std::vector<std::string> labels;
 
     // from the standard metadata
+    // {arch}.attention.causal, and what the readout is derived from. Also decides whether a
+    // shared prefix is really shared: see plan::share_prefix.
+    bool causal = true;
+
     llama_token mask_token = -1;    // tokenizer.ggml.mask_token_id
     std::string mask_text;          // its piece, so a template can write it
     std::string bos_text;           // likewise for BOS: the template writes it, as chat
@@ -105,6 +109,13 @@ struct plan {
         tokenized tok;              // ids, and the answer slots when the readout has any
         size_t    question = 0;     // rank_head: the question this sequence scores
         size_t    option   = 0;     // rank_head: the option it scores
+
+        // How many leading tokens this sequence has in common with the first sequence of its
+        // question, and which that is. A caller with a causal model can decode that prefix
+        // once and copy its KV to the rest instead of recomputing it per option; see
+        // plan::share_prefix for when that is allowed.
+        size_t    shares_with = 0;
+        size_t    n_shared    = 0;
     };
 
     std::vector<sequence>    sequences;
@@ -113,6 +124,11 @@ struct plan {
 
     bool rank_pooling = false;  // sequences are scored by the model's head, not read at a slot
     bool prefix_reuse = true;   // false when attention is bidirectional: nothing is reusable
+
+    // Whether the sequences' shared prefixes may actually be shared. Bidirectional attention
+    // makes a prefix's representation depend on what follows it, so the same tokens are not
+    // the same computation and n_shared must be ignored; a causal model has no such problem.
+    bool share_prefix = false;
 };
 
 // A noul question with no options declared gets {"no","yes"}: which words the two sides of
@@ -138,6 +154,7 @@ struct layout {
     std::vector<llama_token> labels;
     bool rank_pooling = false;
     bool prefix_reuse = true;
+    bool share_prefix = false;
 };
 
 bool build_layout(const so_config & cfg,
@@ -209,6 +226,8 @@ bool answers_from_scores(const plan & p, const std::vector<float> & scores,
 struct context_needs {
     bool               embeddings   = false;                          // rank_head answers through the head
     enum llama_pooling_type pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED; // ... pooled as a rank score
+    bool               share_prefix = false; // the sequences want to share a prefix's KV, which
+                                             // a partial seq_cp() can only do within one stream
     size_t             n_seq        = 1;  // sequences that would go into one decode
     size_t             n_tokens     = 0;  // ... and how many tokens that is
 };

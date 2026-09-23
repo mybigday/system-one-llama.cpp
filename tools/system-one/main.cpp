@@ -232,6 +232,10 @@ static bool decode_slots(llama_context * ctx, const system_one::plan & p,
 // many as the context allows share a decode. Two limits set the chunk size and both are asked
 // of the context: a sequence needs a seq_id of its own, and a bidirectional model cannot have
 // a sequence split across ubatches, so a whole chunk has to fit in one.
+//
+// When the plan says the sequences may share their prefix -- the state and the question, which
+// only a causal model can share because a bidirectional one recomputes them from what follows
+// -- the head is decoded once and its KV copied, so the state costs one pass instead of K.
 static bool decode_ranked(llama_context * ctx, const system_one::plan & p,
                           std::vector<system_one::answer> & out, std::string & err) {
     const uint32_t n_ubatch  = llama_n_ubatch(ctx);
@@ -256,12 +260,47 @@ static bool decode_ranked(llama_context * ctx, const system_one::plan & p,
 
         llama_memory_clear(llama_get_memory(ctx), true);
 
+        // the prefix every sequence in this chunk agrees on, if sharing is allowed at all
+        size_t n_prefix = 0;
+        if (p.share_prefix && n_seq > 1) {
+            n_prefix = p.sequences[i + 1].n_shared;
+            for (size_t k = 2; k < n_seq; k++) {
+                n_prefix = std::min(n_prefix, p.sequences[i + k].n_shared);
+            }
+            // only worth a decode of its own if it is most of the work
+            if (n_prefix * 2 < p.sequences[i].tok.ids.size()) {
+                n_prefix = 0;
+            }
+        }
+
+        if (n_prefix > 0) {
+            const auto & ids = p.sequences[i].tok.ids;
+            llama_batch pre = llama_batch_init((int32_t) n_prefix, 0, 1);
+            pre.n_tokens = (int32_t) n_prefix;
+            for (size_t j = 0; j < n_prefix; j++) {
+                pre.token[j]     = ids[j];
+                pre.pos[j]       = (llama_pos) j;
+                pre.n_seq_id[j]  = 1;
+                pre.seq_id[j][0] = 0;
+                pre.logits[j]    = 0;
+            }
+            const int rc = llama_decode(ctx, pre);
+            llama_batch_free(pre);
+            if (rc != 0) {
+                err = "llama_decode failed on the shared prefix";
+                return false;
+            }
+            for (size_t k = 1; k < n_seq; k++) {
+                llama_memory_seq_cp(llama_get_memory(ctx), 0, (llama_seq_id) k, 0, (llama_pos) n_prefix);
+            }
+        }
+
         llama_batch batch = llama_batch_init((int32_t) n_tok, 0, (int32_t) n_seq);
-        batch.n_tokens = (int32_t) n_tok;
-        size_t at = 0;
+        batch.n_tokens = 0;
         for (size_t k = 0; k < n_seq; k++) {
             const auto & ids = p.sequences[i + k].tok.ids;
-            for (size_t j = 0; j < ids.size(); j++, at++) {
+            for (size_t j = n_prefix; j < ids.size(); j++) {
+                const int32_t at = batch.n_tokens++;
                 batch.token[at]     = ids[j];
                 batch.pos[at]       = (llama_pos) j;
                 batch.n_seq_id[at]  = 1;
@@ -362,6 +401,11 @@ int main(int argc, char ** argv) {
     }
     if (need.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED) {
         params.pooling_type = need.pooling_type;
+    }
+    if (need.share_prefix) {
+        // the sequences share their prefix by copying a range of its KV to the others, and a
+        // partial seq_cp() only works inside one stream -- which is what a unified cache is
+        params.kv_unified = true;
     }
     if (need.n_seq > 1) {
         params.n_parallel = std::max<int32_t>(params.n_parallel, (int32_t) need.n_seq);

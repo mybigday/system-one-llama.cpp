@@ -65,6 +65,7 @@ bool so_config::from_model(const llama_model * model, so_config & out, std::stri
             }
         }
         const bool has_cls_head = llama_model_cls_label(model, 0) != nullptr;
+        out.causal = causal;
 
         out.readout = has_cls_head ? "rank_head" : (causal ? "letter_slot" : "masked_slot");
     }
@@ -372,6 +373,7 @@ bool build_layout(const so_config & cfg,
     if (cfg.ranked()) {
         // the head scores a whole sequence, so each option gets one of its own
         out.rank_pooling = true;
+        out.share_prefix = cfg.causal;   // see plan::share_prefix
         out.prefix_reuse = false;   // the sequences differ from the first token onwards
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
@@ -425,6 +427,7 @@ bool build_plan(const so_config & cfg,
     out.labels       = lay.labels;
     out.rank_pooling = lay.rank_pooling;
     out.prefix_reuse = lay.prefix_reuse;
+    out.share_prefix = lay.share_prefix;
 
     for (const auto & ls : lay.sequences) {
         plan::sequence seq;
@@ -434,6 +437,31 @@ bool build_plan(const so_config & cfg,
             return false;
         }
         out.sequences.push_back(std::move(seq));
+    }
+
+    // The option sequences of one question differ only in the option, so they share a long
+    // head -- the state and the question. Measure it rather than assume where it ends: the
+    // template decides the layout, and a caller that can use it gets the state encoded once
+    // instead of once per option.
+    for (size_t i = 0; i < out.sequences.size(); i++) {
+        auto & seq = out.sequences[i];
+        seq.shares_with = i;
+        seq.n_shared    = 0;
+
+        for (size_t j = 0; j < i; j++) {
+            if (out.sequences[j].question != seq.question) continue;
+
+            const auto & a = out.sequences[j].tok.ids;
+            const auto & b = seq.tok.ids;
+            size_t n = 0;
+            while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+
+            // the sequence still has to contribute something of its own
+            if (n > seq.n_shared && n < b.size()) {
+                seq.shares_with = j;
+                seq.n_shared    = n;
+            }
+        }
     }
     return true;
 }
@@ -517,6 +545,7 @@ context_needs required_context(const so_config & cfg, const plan & p) {
         need.pooling_type = LLAMA_POOLING_TYPE_RANK;
     }
 
+    need.share_prefix = p.share_prefix && p.sequences.size() > 1;
     need.n_seq = std::min<size_t>(p.sequences.size(), MAX_BATCHED_SEQS);
     for (size_t i = 0; i < need.n_seq; i++) {
         need.n_tokens += p.sequences[i].tok.ids.size();
