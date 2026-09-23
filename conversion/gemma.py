@@ -978,6 +978,15 @@ class Gemma4VisionAudioModel(MmprojModel):
         self.gguf_writer.add_clip_vision_projector_type(gguf.VisionProjectorType.GEMMA4V)
         self.gguf_writer.add_vision_attention_layernorm_eps(self.hparams_vision.get("layer_norm_eps", 1e-6))
 
+        # The FFN activation has to be declared: clip.cpp picks it from use_gelu / use_silu and
+        # falls back to *quick* GELU when neither is set, which is a different approximation from
+        # the tanh one this tower is trained with. Ask the config rather than assume, and refuse
+        # anything unrecognised instead of silently picking the fallback.
+        vision_act = self.hparams_vision.get("hidden_activation", "gelu_pytorch_tanh")
+        if vision_act not in ("gelu_pytorch_tanh", "gelu"):
+            raise ValueError(f"unsupported Gemma4 vision activation: {vision_act}")
+        self.gguf_writer.add_vision_use_gelu(True)
+
         # audio params
         if self.has_audio_encoder:
             assert self.hparams_audio is not None
