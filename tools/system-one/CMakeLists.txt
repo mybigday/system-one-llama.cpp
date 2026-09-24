@@ -18,3 +18,17 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+
+# DiffusionGemma is an encoder-decoder whose arch is not upstream, and its answer is read from
+# the canvas rather than from inside the prompt. That is a different drive loop, not a flag, so
+# it is its own command instead of a branch in the shared route.
+if (TARGET llama-system-one)
+    set(TARGET llama-system-one-diffusion)
+    add_executable(${TARGET} diffusion.cpp)
+    target_link_libraries(${TARGET} PRIVATE system-one llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${TARGET} RUNTIME)
+    endif()
+endif()

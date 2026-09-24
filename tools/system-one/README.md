@@ -91,6 +91,46 @@ side back, which is how a prompt is kept identical between this CLI and a server
 The instructions in `--noul` / `--choice` / `--score` may not contain a colon; that is what the
 JSON request is for, along with anything else more elaborate than a one-off from the shell.
 
+## llama-system-one-diffusion
+
+DiffusionGemma does not fit the readouts above, and it has its own command rather than a flag.
+It is an encoder-decoder: a causal encoder over the prompt, then a **canvas** of
+`diffusion.canvas_length` positions denoised bidirectionally against the encoder's K,V. The
+answer is read from the canvas, not from inside the prompt.
+
+A plain `llama_decode` -- which is all the library and the server ever issue -- lands in the
+arch's unified branch, where the region split is positional:
+
+```
+P = n_tokens - canvas_length
+```
+
+so the boundary falls wherever the prompt happens to end. On a 380-token request with a
+256-token canvas that is token 124, in the middle of the state: part of the state gets denoised
+as if it were an answer, and the first question's mask sits on the causal-prompt side. The
+numbers that come out are a faithful reproduction of a configuration the model was never
+trained in.
+
+This command drives the model's own path instead. The template writes both regions, separated
+by a segment that is exactly the canvas marker (`<|canvas|>` by default): the state and the
+question *text* go in front of it, and after it one labelled, masked answer slot per question
+(`q1: <mask>`), which is how the model is used in the wild. The canvas is padded to
+`canvas_length` with the mask token, since an unfilled canvas position is a mask.
+
+```
+llama-system-one-diffusion model.gguf golden.json --template-file tmpl.jinja \
+    [--mode prefill|unified|both] [--dry-run] [--limit N] [--threads N] [--dump out.json]
+```
+
+`--dry-run` loads the vocabulary only and prints how the template split, so the layout can be
+checked without the weights. `--mode both` runs the cached path and the single-batch path and
+reports the largest disagreement at the answer slots: the arch specifies they agree to f32
+round-off, so that is a check on the layout that needs no reference implementation.
+
+It is a separate command because the phase it drives (`llama_diffusion_set_phase`) belongs to
+one arch that is not upstream, and because that phase is set on the *model*, which a server
+shares between slots.
+
 ## The prompt format belongs to the checkpoint
 
 It is a Jinja template stored in the GGUF as the named chat template `system_one`, rendered
