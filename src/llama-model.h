@@ -163,6 +163,26 @@ std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_ty
 // the string is empty or not recognized.
 llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op_type fallback);
 
+// laya's decision head: two ordinary pre-norm transformer layers run over the whole sequence
+// after the encoder, with biases and no positional encoding -- not the backbone's layer type.
+struct llama_layer_dhead {
+    struct ggml_tensor * attn_norm   = nullptr;
+    struct ggml_tensor * attn_norm_b = nullptr;
+
+    struct ggml_tensor * wqkv        = nullptr;
+    struct ggml_tensor * wqkv_b      = nullptr;
+    struct ggml_tensor * wo          = nullptr;
+    struct ggml_tensor * wo_b        = nullptr;
+
+    struct ggml_tensor * ffn_norm    = nullptr;
+    struct ggml_tensor * ffn_norm_b  = nullptr;
+
+    struct ggml_tensor * ffn_up      = nullptr;
+    struct ggml_tensor * ffn_up_b    = nullptr;
+    struct ggml_tensor * ffn_down    = nullptr;
+    struct ggml_tensor * ffn_down_b  = nullptr;
+};
+
 struct llama_layer_posnet {
     // resnet
     struct ggml_tensor * norm1   = nullptr;
@@ -661,6 +681,16 @@ struct llama_model {
     struct ggml_tensor * hc_head_scale = nullptr;
 
     // classifier
+    std::vector<llama_layer_dhead> dhead_layers;
+
+    struct ggml_tensor * qtype_embd  = nullptr;
+    struct ggml_tensor * scorer_norm = nullptr;
+    struct ggml_tensor * scorer_norm_b = nullptr;
+    struct ggml_tensor * scorer      = nullptr;
+    struct ggml_tensor * scorer_b    = nullptr;
+    struct ggml_tensor * scorer_out  = nullptr;
+    struct ggml_tensor * scorer_out_b = nullptr;
+
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;
     struct ggml_tensor * cls_out   = nullptr;

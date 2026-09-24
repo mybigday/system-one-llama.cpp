@@ -1004,6 +1004,18 @@ class GGUFWriter:
     def add_value_residual_mix_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.VALUE_RESIDUAL_MIX_LORA_RANK.format(arch=self.arch), length)
 
+    def add_decision_head_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.DecisionHead.BLOCK_COUNT.format(arch=self.arch), value)
+
+    def add_decision_head_qtype_token_ids(self, value: Sequence[int]) -> None:
+        self.add_array(Keys.DecisionHead.QTYPE_TOKEN_IDS.format(arch=self.arch), value)
+
+    def add_decision_head_qtype_token_index(self, value: int) -> None:
+        self.add_uint32(Keys.DecisionHead.QTYPE_TOKEN_INDEX.format(arch=self.arch), value)
+
+    def add_decision_head_calibration_temperature(self, value: Sequence[float]) -> None:
+        self.add_array(Keys.DecisionHead.CALIBRATION_TEMPERATURE.format(arch=self.arch), value)
+
     def add_rope_freq_base_swa(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE_SWA.format(arch=self.arch), value)
 

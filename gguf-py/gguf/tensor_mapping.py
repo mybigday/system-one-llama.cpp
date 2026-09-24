@@ -1484,6 +1484,46 @@ class TensorNameMap:
             "backbone.posnet.{bid}.norm", # wavtokenizer
         ),
 
+        MODEL_TENSOR.DHEAD_ATTN_NORM: (
+            "head.layers.{bid}.norm1", # laya
+        ),
+
+        MODEL_TENSOR.DHEAD_ATTN_QKV: (
+            "head.layers.{bid}.self_attn.in_proj", # laya
+        ),
+
+        MODEL_TENSOR.DHEAD_ATTN_OUT: (
+            "head.layers.{bid}.self_attn.out_proj", # laya
+        ),
+
+        MODEL_TENSOR.DHEAD_FFN_NORM: (
+            "head.layers.{bid}.norm2", # laya
+        ),
+
+        MODEL_TENSOR.DHEAD_FFN_UP: (
+            "head.layers.{bid}.linear1", # laya
+        ),
+
+        MODEL_TENSOR.DHEAD_FFN_DOWN: (
+            "head.layers.{bid}.linear2", # laya
+        ),
+
+        MODEL_TENSOR.QTYPE_EMBD: (
+            "type_emb", # laya
+        ),
+
+        MODEL_TENSOR.SCORER_NORM: (
+            "scorer.0", # laya
+        ),
+
+        MODEL_TENSOR.SCORER: (
+            "scorer.1", # laya
+        ),
+
+        MODEL_TENSOR.SCORER_OUT: (
+            "scorer.3", # laya
+        ),
+
         MODEL_TENSOR.POSNET_ATTN_Q: (
             "backbone.posnet.{bid}.q", # wavtokenizer
         ),

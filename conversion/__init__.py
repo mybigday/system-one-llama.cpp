@@ -188,6 +188,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Mistral3ForConditionalGeneration": "mistral3",
     "MistralForCausalLM": "llama",
     "MixtralForCausalLM": "llama",
+    "LayaDecisionModel": "laya",
     "ModernBertForMaskedLM": "bert",
     "ModernBertForSequenceClassification": "bert",
     "ModernBertModel": "bert",

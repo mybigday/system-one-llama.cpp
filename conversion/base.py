@@ -1881,6 +1881,9 @@ class TextModel(ModelBase):
         if chkhsh == "f241072145675bf8322086f115aebad05e9f869557a238bf2150a2a417d1bf60":
             # ref: https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2
             res = "granite-embed-multi-97m"
+        if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
+            # ref: https://huggingface.co/jhu-clsp/mmBERT-base
+            res = "mmbert"
         if chkhsh == "789696f5946cc0fc59371f39f6097cafed196b3acded6140432f26bbb1ae1669":
             # ref: https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2
             res = "granite-embed-multi-311m"

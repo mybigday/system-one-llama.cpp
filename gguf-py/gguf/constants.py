@@ -307,6 +307,12 @@ class Keys:
         EMBEDDING_LENGTH = "{arch}.convnext.embedding_length"
         BLOCK_COUNT      = "{arch}.convnext.block_count"
 
+    class DecisionHead:
+        BLOCK_COUNT             = "{arch}.decision_head.block_count"
+        QTYPE_TOKEN_IDS         = "{arch}.decision_head.qtype_token_ids"
+        QTYPE_TOKEN_INDEX       = "{arch}.decision_head.qtype_token_index"
+        CALIBRATION_TEMPERATURE = "{arch}.decision_head.calibration_temperature"
+
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
 
@@ -513,6 +519,7 @@ class MODEL_ARCH(IntEnum):
     REFACT           = auto()
     BERT             = auto()
     MODERN_BERT      = auto()
+    LAYA             = auto()
     NOMIC_BERT       = auto()
     NOMIC_BERT_MOE   = auto()
     NEO_BERT         = auto()
@@ -891,6 +898,16 @@ class MODEL_TENSOR(IntEnum):
     CONVNEXT_PW1         = auto()
     CONVNEXT_PW2         = auto()
     CONVNEXT_GAMMA       = auto()
+    DHEAD_ATTN_NORM      = auto()
+    DHEAD_ATTN_QKV       = auto()
+    DHEAD_ATTN_OUT       = auto()
+    DHEAD_FFN_NORM       = auto()
+    DHEAD_FFN_UP         = auto()
+    DHEAD_FFN_DOWN       = auto()
+    QTYPE_EMBD           = auto()
+    SCORER_NORM          = auto()
+    SCORER               = auto()
+    SCORER_OUT           = auto()
     POSNET_CONV1         = auto()
     POSNET_CONV2         = auto()
     POSNET_NORM          = auto()
@@ -1276,6 +1293,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.REFACT:           "refact",
     MODEL_ARCH.BERT:             "bert",
     MODEL_ARCH.MODERN_BERT:      "modern-bert",
+    MODEL_ARCH.LAYA:             "laya",
     MODEL_ARCH.NOMIC_BERT:       "nomic-bert",
     MODEL_ARCH.NOMIC_BERT_MOE:   "nomic-bert-moe",
     MODEL_ARCH.NEO_BERT:         "neo-bert",
@@ -1653,6 +1671,16 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.CONVNEXT_PW1:              "convnext.{bid}.pw1",
     MODEL_TENSOR.CONVNEXT_PW2:              "convnext.{bid}.pw2",
     MODEL_TENSOR.CONVNEXT_GAMMA:            "convnext.{bid}.gamma",
+    MODEL_TENSOR.DHEAD_ATTN_NORM:           "dhead.{bid}.attn_norm",
+    MODEL_TENSOR.DHEAD_ATTN_QKV:            "dhead.{bid}.attn_qkv",
+    MODEL_TENSOR.DHEAD_ATTN_OUT:            "dhead.{bid}.attn_output",
+    MODEL_TENSOR.DHEAD_FFN_NORM:            "dhead.{bid}.ffn_norm",
+    MODEL_TENSOR.DHEAD_FFN_UP:              "dhead.{bid}.ffn_up",
+    MODEL_TENSOR.DHEAD_FFN_DOWN:            "dhead.{bid}.ffn_down",
+    MODEL_TENSOR.QTYPE_EMBD:                "qtype_embd",
+    MODEL_TENSOR.SCORER_NORM:               "scorer_norm",
+    MODEL_TENSOR.SCORER:                    "scorer",
+    MODEL_TENSOR.SCORER_OUT:                "scorer_out",
     MODEL_TENSOR.POSNET_CONV1:              "posnet.{bid}.conv1",
     MODEL_TENSOR.POSNET_CONV2:              "posnet.{bid}.conv2",
     MODEL_TENSOR.POSNET_NORM:               "posnet.{bid}.norm",
@@ -2499,6 +2527,27 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.CLS_NORM,
+    ],
+    MODEL_ARCH.LAYA: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.DHEAD_ATTN_NORM,
+        MODEL_TENSOR.DHEAD_ATTN_QKV,
+        MODEL_TENSOR.DHEAD_ATTN_OUT,
+        MODEL_TENSOR.DHEAD_FFN_NORM,
+        MODEL_TENSOR.DHEAD_FFN_UP,
+        MODEL_TENSOR.DHEAD_FFN_DOWN,
+        MODEL_TENSOR.QTYPE_EMBD,
+        MODEL_TENSOR.SCORER_NORM,
+        MODEL_TENSOR.SCORER,
+        MODEL_TENSOR.SCORER_OUT,
     ],
     MODEL_ARCH.NOMIC_BERT: [
         MODEL_TENSOR.TOKEN_EMBD,

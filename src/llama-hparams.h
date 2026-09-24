@@ -237,6 +237,13 @@ struct llama_hparams {
     // for Classifiers
     uint32_t n_cls_out = 1;
 
+    // laya's decision head: how many post-encoder layers, and how to recover the question type
+    // from the prompt -- the three ids are the first token of "choice" / "score" / "noul" in the
+    // checkpoint's own tokenizer, in the model's own type order, at a declared position.
+    uint32_t n_dhead_layer     = 0;
+    uint32_t qtype_token_index = 0;
+    std::array<int32_t, 3> qtype_token_ids = { -1, -1, -1 };
+
     // input embedding dimension (0 = use n_embd)
     uint32_t n_embd_inp_impl = 0;
 

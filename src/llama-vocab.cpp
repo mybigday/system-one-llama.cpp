@@ -2251,6 +2251,13 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     tokenizer_pre == "jais-2") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_JAIS2;
             } else if (
+                    tokenizer_pre == "mmbert") {
+                // Metaspace with split: the normalizer turns every space into U+2581 and the
+                // pre-tokenizer then splits on it, so the pieces are whitespace-delimited runs
+                // of an escaped string -- not byte-level BPE.
+                pre_type = LLAMA_VOCAB_PRE_TYPE_WHITESPACE;
+                escape_whitespaces = true;
+            } else if (
                     tokenizer_pre == "gemma4" ||
                     tokenizer_pre == "granite-embed-multi-311m") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GEMMA4;
