@@ -312,6 +312,7 @@ class Keys:
         QTYPE_TOKEN_IDS         = "{arch}.decision_head.qtype_token_ids"
         QTYPE_TOKEN_INDEX       = "{arch}.decision_head.qtype_token_index"
         CALIBRATION_TEMPERATURE = "{arch}.decision_head.calibration_temperature"
+        SLOT_TOKEN_ID           = "{arch}.decision_head.slot_token_id"
 
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
@@ -520,6 +521,7 @@ class MODEL_ARCH(IntEnum):
     BERT             = auto()
     MODERN_BERT      = auto()
     LAYA             = auto()
+    GLICLASS         = auto()
     NOMIC_BERT       = auto()
     NOMIC_BERT_MOE   = auto()
     NEO_BERT         = auto()
@@ -905,6 +907,10 @@ class MODEL_TENSOR(IntEnum):
     DHEAD_FFN_UP         = auto()
     DHEAD_FFN_DOWN       = auto()
     QTYPE_EMBD           = auto()
+    CLASS_PROJ_1         = auto()
+    CLASS_PROJ_2         = auto()
+    TEXT_PROJ_1          = auto()
+    TEXT_PROJ_2          = auto()
     SCORER_NORM          = auto()
     SCORER               = auto()
     SCORER_OUT           = auto()
@@ -1294,6 +1300,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.BERT:             "bert",
     MODEL_ARCH.MODERN_BERT:      "modern-bert",
     MODEL_ARCH.LAYA:             "laya",
+    MODEL_ARCH.GLICLASS:         "gliclass",
     MODEL_ARCH.NOMIC_BERT:       "nomic-bert",
     MODEL_ARCH.NOMIC_BERT_MOE:   "nomic-bert-moe",
     MODEL_ARCH.NEO_BERT:         "neo-bert",
@@ -1678,6 +1685,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DHEAD_FFN_UP:              "dhead.{bid}.ffn_up",
     MODEL_TENSOR.DHEAD_FFN_DOWN:            "dhead.{bid}.ffn_down",
     MODEL_TENSOR.QTYPE_EMBD:                "qtype_embd",
+    MODEL_TENSOR.CLASS_PROJ_1:              "class_proj.1",
+    MODEL_TENSOR.CLASS_PROJ_2:              "class_proj.2",
+    MODEL_TENSOR.TEXT_PROJ_1:               "text_proj.1",
+    MODEL_TENSOR.TEXT_PROJ_2:               "text_proj.2",
     MODEL_TENSOR.SCORER_NORM:               "scorer_norm",
     MODEL_TENSOR.SCORER:                    "scorer",
     MODEL_TENSOR.SCORER_OUT:                "scorer_out",
@@ -2527,6 +2538,21 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.CLS_NORM,
+    ],
+    MODEL_ARCH.GLICLASS: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.CLASS_PROJ_1,
+        MODEL_TENSOR.CLASS_PROJ_2,
+        MODEL_TENSOR.TEXT_PROJ_1,
+        MODEL_TENSOR.TEXT_PROJ_2,
     ],
     MODEL_ARCH.LAYA: [
         MODEL_TENSOR.TOKEN_EMBD,

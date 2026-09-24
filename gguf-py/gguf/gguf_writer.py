@@ -1013,6 +1013,9 @@ class GGUFWriter:
     def add_decision_head_qtype_token_index(self, value: int) -> None:
         self.add_uint32(Keys.DecisionHead.QTYPE_TOKEN_INDEX.format(arch=self.arch), value)
 
+    def add_decision_head_slot_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.DecisionHead.SLOT_TOKEN_ID.format(arch=self.arch), value)
+
     def add_decision_head_calibration_temperature(self, value: Sequence[float]) -> None:
         self.add_array(Keys.DecisionHead.CALIBRATION_TEMPERATURE.format(arch=self.arch), value)
 

@@ -1508,6 +1508,22 @@ class TensorNameMap:
             "head.layers.{bid}.linear2", # laya
         ),
 
+        MODEL_TENSOR.CLASS_PROJ_1: (
+            "classes_projector.linear_1", # gliclass
+        ),
+
+        MODEL_TENSOR.CLASS_PROJ_2: (
+            "classes_projector.linear_2", # gliclass
+        ),
+
+        MODEL_TENSOR.TEXT_PROJ_1: (
+            "text_projector.linear_1", # gliclass
+        ),
+
+        MODEL_TENSOR.TEXT_PROJ_2: (
+            "text_projector.linear_2", # gliclass
+        ),
+
         MODEL_TENSOR.QTYPE_EMBD: (
             "type_emb", # laya
         ),

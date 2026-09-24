@@ -80,6 +80,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_modern_bert(params);
         case LLM_ARCH_LAYA:
             return new llama_model_laya(params);
+        case LLM_ARCH_GLICLASS:
+            return new llama_model_gliclass(params);
         case LLM_ARCH_NEO_BERT:
             return new llama_model_neo_bert(params);
         case LLM_ARCH_EUROBERT:
@@ -2291,6 +2293,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_LAYA:
+        case LLM_ARCH_GLICLASS:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
         case LLM_ARCH_LLADA:
@@ -2989,6 +2992,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_LAYA:
+        case LLM_ARCH_GLICLASS:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
         case LLM_ARCH_EUROBERT:

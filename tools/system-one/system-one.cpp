@@ -67,9 +67,11 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     //   a classification head  -> the answer is that head's score, one sequence per option
     //   bidirectional          -> the answer is read at a mask token inside the question
     //   otherwise              -> the answer is the next token after the question
+    std::string arch_name;
+    meta_str(model, "general.architecture", arch_name);
+
     {
-        std::string arch;
-        meta_str(model, "general.architecture", arch);
+        const std::string & arch = arch_name;
 
         bool causal = true;
         if (!arch.empty()) {
@@ -133,10 +135,20 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     }
 
     if (out.readout == SYSTEM_ONE_READOUT_MASKED_SLOT || out.readout == SYSTEM_ONE_READOUT_SCORED_SLOT) {
-        out.mask_token = llama_vocab_mask(vocab);
+        // Which token marks an answer is the architecture's, not the tokenizer's: a masked LM
+        // marks with its mask token, a class-token head with its own. The arch says so when it
+        // differs, the way laya's question-type ids do.
+        std::string marker;
+        if (!arch_name.empty() &&
+            meta_str(model, (arch_name + ".decision_head.slot_token_id").c_str(), marker) && !marker.empty()) {
+            out.mask_token = (llama_token) std::stoi(marker);
+        } else {
+            out.mask_token = llama_vocab_mask(vocab);
+        }
         if (out.mask_token < 0) {
             throw std::runtime_error(std::string(system_one_readout_name(out.readout)) +
-                  " needs the model's tokenizer.ggml.mask_token_id");
+                  " needs a slot marker: {arch}.decision_head.slot_token_id, or the model's "
+                  "tokenizer.ggml.mask_token_id");
         }
         const char * piece = llama_vocab_get_text(vocab, out.mask_token);
         out.mask_text = piece ? piece : "";

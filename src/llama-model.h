@@ -684,6 +684,16 @@ struct llama_model {
     std::vector<llama_layer_dhead> dhead_layers;
 
     struct ggml_tensor * qtype_embd  = nullptr;
+
+    // gliclass: two projections whose dot product is one candidate's score
+    struct ggml_tensor * class_proj_1   = nullptr;
+    struct ggml_tensor * class_proj_1_b = nullptr;
+    struct ggml_tensor * class_proj_2   = nullptr;
+    struct ggml_tensor * class_proj_2_b = nullptr;
+    struct ggml_tensor * text_proj_1    = nullptr;
+    struct ggml_tensor * text_proj_1_b  = nullptr;
+    struct ggml_tensor * text_proj_2    = nullptr;
+    struct ggml_tensor * text_proj_2_b  = nullptr;
     struct ggml_tensor * scorer_norm = nullptr;
     struct ggml_tensor * scorer_norm_b = nullptr;
     struct ggml_tensor * scorer      = nullptr;
