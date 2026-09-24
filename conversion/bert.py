@@ -625,6 +625,14 @@ class ModernBertModel(BertModel):
 
         self._set_vocab_gpt2()
 
+        # A BPE model is not necessarily byte-level: mmBERT's is Metaspace, where the pre-tokenizer
+        # puts U+2581 in front of every piece it is handed. Say so rather than let the runtime
+        # guess from the pre-tokenizer name.
+        with open(self.dir_model / "tokenizer.json", encoding="utf-8") as f:
+            pre = json.load(f).get("pre_tokenizer") or {}
+        if pre.get("type") == "Metaspace" and pre.get("prepend_scheme") == "always":
+            self.gguf_writer.add_add_space_prefix(True)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 

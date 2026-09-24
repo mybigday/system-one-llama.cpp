@@ -2252,11 +2252,13 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_JAIS2;
             } else if (
                     tokenizer_pre == "mmbert") {
-                // Metaspace with split: the normalizer turns every space into U+2581 and the
-                // pre-tokenizer then splits on it, so the pieces are whitespace-delimited runs
-                // of an escaped string -- not byte-level BPE.
+                // Metaspace, not byte-level BPE: every space becomes U+2581 and each piece the
+                // tokenizer is handed starts with one. The pieces are what splitting on the
+                // added tokens leaves, which is why a newline -- an added token in this vocab --
+                // is followed by a prefixed piece while a tab, which is not, is not.
                 pre_type = LLAMA_VOCAB_PRE_TYPE_WHITESPACE;
                 escape_whitespaces = true;
+                add_space_prefix   = true;
             } else if (
                     tokenizer_pre == "gemma4" ||
                     tokenizer_pre == "granite-embed-multi-311m") {
@@ -3523,9 +3525,30 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                 if (add_special) {
                     session->append_bos(output);
                 }
+
+                // A Metaspace pre-tokenizer prefixes each piece it is handed, and the pieces are
+                // what the split on added tokens leaves -- so the prefix lands at the start and
+                // again after every token, exactly as the SPM path above does it.
+                //
+                // Gated on escaping too, and not on add_space_prefix alone, because that flag
+                // means two different things: for Metaspace it is this per-piece prefix, escaped
+                // to U+2581; for a byte-level BPE, add_prefix_space is one space at the front of
+                // the whole input, encoded as a byte. A byte-level vocab does not escape
+                // whitespace, so it stays on the behaviour it has today -- which is to ignore the
+                // flag -- rather than silently acquiring the wrong one.
+                const bool prefix_pieces = add_space_prefix && escape_whitespaces;
+
+                bool is_prev_special = true;
+
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
-                        std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
+                        std::string text;
+
+                        if (prefix_pieces && is_prev_special) {
+                            text = ' ';
+                        }
+
+                        text += fragment.raw_text.substr(fragment.offset, fragment.length);
 
                         if (escape_whitespaces) {
                             llama_escape_whitespace(text);
@@ -3535,8 +3558,10 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
                         session->tokenize(text, output);
+                        is_prev_special = false;
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         session->append(fragment.token, output);
+                        is_prev_special = true;
                     }
                 }
 
