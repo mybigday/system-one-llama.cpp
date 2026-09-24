@@ -277,6 +277,7 @@ struct server_slot {
     // that finishes the prompt -- hence collecting as we go instead of reading at the end.
     std::vector<std::pair<int32_t, int32_t>> so_outputs;
     std::vector<system_one_answer>          so_answers;
+    std::vector<float>                     so_scores;   // scored readouts: one per slot
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
@@ -411,6 +412,7 @@ struct server_slot {
         generated_token_probs.clear();
         so_outputs.clear();
         so_answers.clear();
+        so_scores.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -2228,20 +2230,25 @@ private:
         res->n_tokens = slot.task->n_tokens();
         res->n_cached = slot.stats.n_prompt_cached;
 
-        const size_t n_questions = slot.task->system_one.slots.size();
-        for (size_t qi = 0; qi < n_questions; qi++) {
-            if (qi >= slot.so_answers.size() || slot.so_answers[qi].probs.empty()) {
-                SLT_ERR(slot, "no answer collected for question %zu\n", qi);
+        const size_t n_slots = slot.task->system_one.slots.size();
+        const bool   scored  = slot.task->system_one.scored;
+        for (size_t qi = 0; qi < n_slots; qi++) {
+            const bool missing = scored
+                ? (qi >= slot.so_scores.size()  || std::isnan(slot.so_scores[qi]))
+                : (qi >= slot.so_answers.size() || slot.so_answers[qi].probs.empty());
+            if (missing) {
+                SLT_ERR(slot, "nothing collected for answer slot %zu\n", qi);
                 send_error(slot, "System One: an answer slot was never decoded", ERROR_TYPE_SERVER);
                 return;
             }
         }
 
         // the slot collects them out of order -- an answer slot can be decoded before the
-        // sub-batch that finishes the prompt -- so they are only put in question order here
+        // sub-batch that finishes the prompt -- so they are only put in slot order here
         res->answers = std::move(slot.so_answers);
+        res->scores  = std::move(slot.so_scores);
 
-        SLT_DBG(slot, "sending System One result for %zu question(s)\n", n_questions);
+        SLT_DBG(slot, "sending System One result for %zu answer slot(s)\n", n_slots);
 
         queue_results.send(std::move(res));
     }
@@ -3922,19 +3929,37 @@ private:
             // i_batch guard below (which only tracks the last prompt token)
             if (slot.task && slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.so_outputs.empty()) {
                 const auto & so = slot.task->system_one;
-                if (slot.so_answers.size() != so.slots.size()) {
-                    slot.so_answers.assign(so.slots.size(), system_one_answer{});
-                }
-                for (const auto & [idx, qi] : slot.so_outputs) {
-                    if (!is_inside_view(idx) || !slot.so_answers[qi].probs.empty()) {
-                        continue;
+                if (so.scored) {
+                    // one number per slot, read where the model put it; the route groups them
+                    if (slot.so_scores.size() != so.slots.size()) {
+                        slot.so_scores.assign(so.slots.size(), std::numeric_limits<float>::quiet_NaN());
                     }
-                    const float * row = llama_get_logits_ith(ctx_tgt, idx - off);
-                    if (row == nullptr) {
-                        SLT_ERR(slot, "failed to get logits for answer slot %d\n", idx);
-                        continue;
+                    for (const auto & [idx, qi] : slot.so_outputs) {
+                        if (!is_inside_view(idx) || !std::isnan(slot.so_scores[qi])) {
+                            continue;
+                        }
+                        const float * row = llama_get_embeddings_ith(ctx_tgt, idx - off);
+                        if (row == nullptr) {
+                            SLT_ERR(slot, "failed to get the score for answer slot %d\n", idx);
+                            continue;
+                        }
+                        slot.so_scores[qi] = row[0];
                     }
-                    slot.so_answers[qi] = system_one_answer_from_logits(row, so.letters, so.n_options[qi]);
+                } else {
+                    if (slot.so_answers.size() != so.slots.size()) {
+                        slot.so_answers.assign(so.slots.size(), system_one_answer{});
+                    }
+                    for (const auto & [idx, qi] : slot.so_outputs) {
+                        if (!is_inside_view(idx) || !slot.so_answers[qi].probs.empty()) {
+                            continue;
+                        }
+                        const float * row = llama_get_logits_ith(ctx_tgt, idx - off);
+                        if (row == nullptr) {
+                            SLT_ERR(slot, "failed to get logits for answer slot %d\n", idx);
+                            continue;
+                        }
+                        slot.so_answers[qi] = system_one_answer_from_logits(row, so.letters, so.n_options[qi]);
+                    }
                 }
             }
 
@@ -5647,6 +5672,66 @@ const json & st = body.at("state");
                     scores[rr->index] = rr->score;
                     n_tokens_in      += rr->n_tokens;
                 }
+            }
+
+            answers = system_one_answers_from_scores(plan, scores);
+        } else if (plan.scored_slots) {
+            // The model scores positions, and the format asks one question per sequence, so this
+            // is one task per question -- each reading its options' numbers out of the model's
+            // own head rather than a distribution over letters.
+            if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+                res->error(format_error_response(
+                    "this model answers with one number per position; start the server with "
+                    "--embeddings --pooling none",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            if (!state_files.empty()) {
+                res->error(format_error_response(
+                    "media in \"state\" is not supported for this readout: each question is its own "
+                    "sequence, so the media would be encoded once per question",
+                    ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+
+            auto & rd_scored = res->rd;
+            {
+                std::vector<server_task> tasks;
+                tasks.reserve(plan.sequences.size());
+                for (size_t i = 0; i < plan.sequences.size(); i++) {
+                    const auto & seq = plan.sequences[i];
+
+                    server_task task(SERVER_TASK_TYPE_SYSTEM_ONE);
+                    task.id     = rd_scored.get_new_id();
+                    task.index  = i;
+                    task.tokens = server_tokens(seq.tok.ids, false);
+                    task.system_one.slots      = seq.tok.slots;
+                    task.system_one.n_options  = { plan.n_options[seq.question] };
+                    task.system_one.scored     = true;
+                    task.system_one.n_reusable = seq.n_reusable;
+                    tasks.push_back(std::move(task));
+                }
+                rd_scored.post_tasks(std::move(tasks));
+            }
+
+            auto all = rd_scored.wait_for_all(req.should_stop);
+            if (all.is_terminated) return res;
+            if (all.error) { res->error(all.error->to_json()); return res; }
+
+            std::vector<std::vector<float>> per_sequence(plan.sequences.size());
+            for (auto & one : all.results) {
+                auto * sr = dynamic_cast<server_task_result_system_one *>(one.get());
+                GGML_ASSERT(sr != nullptr);
+                if ((size_t) sr->index < per_sequence.size()) {
+                    per_sequence[sr->index] = std::move(sr->scores);
+                    n_tokens_in += sr->n_tokens;
+                    n_cached    += sr->n_cached;
+                }
+            }
+
+            std::vector<float> scores;
+            for (auto & one : per_sequence) {
+                scores.insert(scores.end(), one.begin(), one.end());
             }
 
             answers = system_one_answers_from_scores(plan, scores);

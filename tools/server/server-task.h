@@ -162,6 +162,10 @@ struct server_task {
         std::vector<int32_t>     n_options;
         std::vector<llama_token> letters;
 
+        // A scored readout reads one number per slot out of the model's own head rather than a
+        // distribution over letters, so the numbers come back as scores for the route to group.
+        bool scored = false;
+
         // a bidirectional readout cannot reuse a cached prefix: every position attends to
         // every other, so a changed tail changes the representation of the head too
         // how far a reused prompt prefix may extend into this sequence; the library works it
@@ -205,6 +209,10 @@ struct server_task {
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 return true;
+            case SERVER_TASK_TYPE_SYSTEM_ONE:
+                // a scored readout reads the model's own number at each slot, which arrives
+                // through the embeddings output and not the vocabulary one
+                return system_one.scored;
             default:
                 return false;
         }
@@ -212,9 +220,10 @@ struct server_task {
 
     bool need_logits() const {
         switch (type) {
+            case SERVER_TASK_TYPE_SYSTEM_ONE:
+                return !system_one.scored;
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
-            case SERVER_TASK_TYPE_SYSTEM_ONE:
                 return true;
             default:
                 return false;
@@ -489,6 +498,7 @@ struct server_task_result_embd : server_task_result {
 // taken apart, because putting them back together would be the same softmax twice.
 struct server_task_result_system_one : server_task_result {
     std::vector<system_one_answer> answers;   // in question order
+    std::vector<float>             scores;    // scored readouts: one per slot, in slot order
 
     int32_t n_tokens = 0;
     int32_t n_cached = 0;   // prompt tokens served from the KV cache

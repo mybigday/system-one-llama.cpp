@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <vector>
+
 // The question type is not carried by the batch and does not have to be: laya writes the word
 // "choice" / "score" / "noul" into the prompt itself. Which token that is depends on the
 // checkpoint's tokenizer, so the three ids and the position are declared as arch metadata and
@@ -16,28 +18,34 @@ public:
 
         GGML_ASSERT(ggml_backend_buffer_is_host(qtype->buffer));
 
-        int32_t * data = (int32_t *) qtype->data;
-        std::fill(data, data + ubatch->n_seqs_unq, 0);
+        // First which type each sequence asks, then that answer for each of its tokens. Per token
+        // and not per sequence: several sequences share a ubatch, and a per-sequence row could
+        // only reach their tokens by a broadcast that does not know where one sequence ends.
+        std::vector<int32_t> by_seq(ubatch->n_seqs_unq, 0);
 
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
             if ((uint32_t) ubatch->pos[i] != hparams.qtype_token_index) {
                 continue;
             }
 
-            for (int32_t s = 0; s < ubatch->n_seq_id[i]; ++s) {
-                const int32_t seq_idx = ubatch->seq_idx[ubatch->seq_id[i][s]];
-
-                for (size_t t = 0; t < hparams.qtype_token_ids.size(); ++t) {
-                    if (ubatch->token[i] == hparams.qtype_token_ids[t]) {
-                        data[seq_idx] = (int32_t) t;
-                        break;
-                    }
+            for (size_t t = 0; t < hparams.qtype_token_ids.size(); ++t) {
+                if (ubatch->token[i] != hparams.qtype_token_ids[t]) {
+                    continue;
                 }
+                for (int32_t s = 0; s < ubatch->n_seq_id[i]; ++s) {
+                    by_seq[ubatch->seq_idx[ubatch->seq_id[i][s]]] = (int32_t) t;
+                }
+                break;
             }
+        }
+
+        int32_t * data = (int32_t *) qtype->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = ubatch->n_seq_id[i] > 0 ? by_seq[ubatch->seq_idx[ubatch->seq_id[i][0]]] : 0;
         }
     }
 
-    ggml_tensor * qtype = nullptr;  // I32 [n_seqs_unq]
+    ggml_tensor * qtype = nullptr;  // I32 [n_tokens]
 
     const llama_hparams & hparams;
 };
@@ -166,7 +174,7 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
     // one of three learned vectors, chosen by the question's type, added to every position
     {
         auto inp = std::make_unique<llm_graph_input_qtype>(hparams);
-        inp->qtype = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
+        inp->qtype = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         ggml_set_input(inp->qtype);
         ggml_set_name(inp->qtype, "qtype");
 
