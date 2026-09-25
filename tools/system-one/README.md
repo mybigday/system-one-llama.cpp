@@ -114,18 +114,35 @@ trained in.
 This command drives the model's own path instead. The template writes both regions, separated
 by a segment that is exactly the canvas marker (`<|canvas|>` by default): the state and the
 question *text* go in front of it, and after it one labelled, masked answer slot per question
-(`q1: <mask>`), which is how the model is used in the wild. The canvas is padded to
-`canvas_length` with the mask token, since an unfilled canvas position is a mask.
+(`q1: <mask>`), which is how the model is used in the wild.
 
 ```
 llama-system-one-diffusion model.gguf golden.json --template-file tmpl.jinja \
-    [--mode prefill|unified|both] [--dry-run] [--limit N] [--threads N] [--dump out.json]
+    [--mode prefill|unified|both] [--pad] [--dry-run] [--control] [--dump-ids PFX] \
+    [--limit N] [--threads N] [--dump out.json]
 ```
 
 `--dry-run` loads the vocabulary only and prints how the template split, so the layout can be
 checked without the weights. `--mode both` runs the cached path and the single-batch path and
-reports the largest disagreement at the answer slots: the arch specifies they agree to f32
-round-off, so that is a check on the layout that needs no reference implementation.
+reports the largest disagreement at the answer slots, judged over each question's own option
+letters rather than the whole vocabulary; `--control` repeats each path so you can see it
+reproduces itself before reading anything into the difference. `--dump-ids` writes the ids in the
+raw int32 format `llama-diffusion-gemma-eval` takes, so the same layout can go through the arch's
+own harness.
+
+**The canvas keeps its rendered length by default, and padding is a flag.** `unified` splits on
+the GGUF `canvas_length` so it has no choice, but DECODE takes the canvas length from the batch --
+and padding is not neutral. Measured against HF on the same prompt, padding a 30-token canvas out
+to 256 with mask tokens moves the model's own answer probabilities by up to **.386** (argmax
+unchanged). Pad only to compare the two paths, which have to see the same canvas.
+
+Two things to know before reading a number off this model. Its logits are **extremely
+precision-sensitive**: rounding the weights bf16 -> f16 with identical arithmetic moves them by
+2.844 on average against a +-30 softcap, so an f16 GGUF of it cannot be validated at the logit
+level at all. And its two paths **disagree with each other** on identical weights (mean 1.9 at
+bf16), which the arch's own source says cannot happen. Where the readout actually reads -- answer
+slots, each question's own options, bf16, unpadded -- llama.cpp and HF agree to |dp| .104 with the
+same argmax on all five questions.
 
 It is a separate command because the phase it drives (`llama_diffusion_set_phase`) belongs to
 one arch that is not upstream, and because that phase is set on the *model*, which a server

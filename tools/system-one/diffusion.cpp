@@ -24,6 +24,12 @@
 //   --dump-ids PFX   write PFX.prompt.i32 and PFX.canvas.i32 (raw little-endian int32) for the
 //                    first item, which is what llama-diffusion-gemma-eval takes -- so the same
 //                    layout can be run through the arch's own harness, DG_CACHED=0 and 1.
+//   --pad            pad the canvas to canvas_length with the mask token. Implied by `unified`
+//                    and `both`, which split on the hparam and cannot do without it. It is NOT
+//                    the default for `prefill`, because padding is not neutral: measured against
+//                    HF on the same prompt, padding a 30-token canvas out to 256 moves the
+//                    model's own answer probabilities by up to .386 (argmax unchanged). DECODE
+//                    takes C from the batch, so the rendered length is the faithful one.
 //   --dry-run        load the vocabulary only and print the layout: how the template split
 //                    into prompt and canvas, and where the answer slots landed. No weights,
 //                    so it is the tokenizer check for this command.
@@ -102,6 +108,9 @@ static layout build_layout(const llama_vocab * vocab, const system_one_params & 
     out.slots         = c.slots;
     out.n_canvas_used = c.ids.size();
 
+    if (canvas_length < 0) {
+        return out;   // --no-pad: DECODE takes C from the batch, so the rendered length stands
+    }
     if ((int) out.canvas.size() > canvas_length) {
         throw std::invalid_argument("the canvas needs " + std::to_string(out.canvas.size()) +
               " tokens but diffusion.canvas_length is " + std::to_string(canvas_length) +
@@ -205,9 +214,10 @@ static int run(int argc, char ** argv) {
     int         limit = -1, ngl = 0;
     int         nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
     std::string mode = "prefill", tmpl_path, dump_path, ids_prefix, marker = "<|canvas|>";
-    bool dry_run = false, control = false;
+    bool dry_run = false, control = false, pad = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) { dry_run = true; }
+        if (strcmp(argv[i], "--pad")     == 0) { pad     = true; }
         if (strcmp(argv[i], "--control") == 0) { control = true; }
     }
     for (int i = 3; i + 1 < argc; i++) {
@@ -219,6 +229,9 @@ static int run(int argc, char ** argv) {
         else if (strcmp(argv[i], "--dump")          == 0) dump_path = argv[++i];
         else if (strcmp(argv[i], "--canvas-marker") == 0) marker    = argv[++i];
         else if (strcmp(argv[i], "--dump-ids")      == 0) ids_prefix = argv[++i];
+    }
+    if (mode != "prefill") {
+        pad = true;   // UNIFIED splits on the hparam, so it has no choice
     }
     if (mode != "prefill" && mode != "unified" && mode != "both") {
         fprintf(stderr, "--mode must be prefill, unified or both\n");
@@ -311,7 +324,8 @@ static int run(int argc, char ** argv) {
 
         layout L;
         try {
-            L = build_layout(vocab, cfg, item.at("state").get<std::string>(), qs, marker, canvas_length);
+            L = build_layout(vocab, cfg, item.at("state").get<std::string>(), qs, marker,
+                             pad ? canvas_length : -1);
         } catch (const std::exception & e) {
             fprintf(stderr, "item %zu: %s\n", it, e.what());
             return 1;
@@ -402,8 +416,9 @@ static int run(int argc, char ** argv) {
         dump.push_back(std::move(ditem));
 
         if (it == 0) {
-            printf("layout: prompt %zu tokens, canvas %zu used of %d, slots at",
-                   L.prompt.size(), L.n_canvas_used, canvas_length);
+            printf("layout: prompt %zu tokens, canvas %zu used of %d (%s), slots at",
+                   L.prompt.size(), L.n_canvas_used, canvas_length,
+                   pad ? "padded to canvas_length" : "as rendered");
             for (int s : L.slots) { printf(" %d", s); }
             printf(" (canvas-relative; every one is inside the canvas by construction)\n");
         }
