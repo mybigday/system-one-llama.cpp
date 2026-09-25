@@ -191,10 +191,12 @@ llama_model_laya::graph::graph(const llama_model & model, const llm_graph_params
     // and no positional encoding -- none of which the encoder's layers use
     for (int64_t i = 0; i < n_dhead; ++i) {
         const auto & layer = model.dhead_layers[i];
-        // -1: these layers are outside the encoder's stack, and anything indexed by a layer
-        // number (the sliding-window pattern, the rope base, the per-layer node bookkeeping)
-        // is the encoder's, not theirs
-        const int    il    = -1;
+        // The head sits after the last encoder layer and runs where it runs, so it borrows that
+        // layer's index: a graph node is placed by `model.dev_layer(il)`, and a fused one is
+        // asserted to have a real index. What these layers genuinely do not share with the
+        // encoder is its sliding-window pattern and its rope -- and neither is taken from `il`
+        // here: the mask is passed explicitly below and there is no positional encoding at all.
+        const int    il    = n_layer - 1;
 
         ggml_tensor * inp = cur;
 
