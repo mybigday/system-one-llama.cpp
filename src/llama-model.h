@@ -698,6 +698,13 @@ struct llama_model {
     struct ggml_tensor * scorer_norm_b = nullptr;
     struct ggml_tensor * scorer      = nullptr;
     struct ggml_tensor * scorer_b    = nullptr;
+    // kev's pointer head: two linear maps of the same hidden state, read at different
+    // positions -- the key at each option's terminator, the query at <decide>.
+    struct ggml_tensor * pointer_q   = nullptr;
+    struct ggml_tensor * pointer_q_b = nullptr;
+    struct ggml_tensor * pointer_k   = nullptr;
+    struct ggml_tensor * pointer_k_b = nullptr;
+
     struct ggml_tensor * scorer_out  = nullptr;
     struct ggml_tensor * scorer_out_b = nullptr;
 

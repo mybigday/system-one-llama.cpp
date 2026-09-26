@@ -241,6 +241,7 @@ struct llama_hparams {
     // from the prompt -- the three ids are the first token of "choice" / "score" / "noul" in the
     // checkpoint's own tokenizer, in the model's own type order, at a declared position.
     uint32_t n_dhead_layer     = 0;
+    uint32_t n_pointer_dim     = 0;
     uint32_t qtype_token_index = 0;
     std::array<int32_t, 3> qtype_token_ids = { -1, -1, -1 };
 

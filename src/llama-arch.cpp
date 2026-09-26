@@ -41,6 +41,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_QWEN35,           "qwen35"           },
+    { LLM_ARCH_KEV,              "kev"              },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
     { LLM_ARCH_PHI2,             "phi2"             },
@@ -368,6 +369,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DECISION_HEAD_QTYPE_TOKEN_INDEX,       "%s.decision_head.qtype_token_index"       },
     { LLM_KV_DECISION_HEAD_CALIBRATION_TEMPERATURE, "%s.decision_head.calibration_temperature" },
     { LLM_KV_DECISION_HEAD_SLOT_TOKEN_ID,           "%s.decision_head.slot_token_id"           },
+    { LLM_KV_DECISION_HEAD_POINTER_DIM,             "%s.decision_head.pointer_dim"             },
 
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
@@ -511,6 +513,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_CLASS_PROJ_2,                           "class_proj.2" },
     { LLM_TENSOR_TEXT_PROJ_1,                            "text_proj.1" },
     { LLM_TENSOR_TEXT_PROJ_2,                            "text_proj.2" },
+    { LLM_TENSOR_POINTER_Q,                              "pointer_q" },
+    { LLM_TENSOR_POINTER_K,                              "pointer_k" },
     { LLM_TENSOR_SCORER_NORM,                            "scorer_norm" },
     { LLM_TENSOR_SCORER,                                 "scorer" },
     { LLM_TENSOR_SCORER_OUT,                             "scorer_out" },
@@ -769,6 +773,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_CLASS_PROJ_2,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_TEXT_PROJ_1,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_TEXT_PROJ_2,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINTER_Q,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINTER_K,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_SCORER_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_SCORER,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_SCORER_OUT,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
@@ -1138,6 +1144,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_KEV:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
@@ -1165,6 +1172,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_KEV:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:

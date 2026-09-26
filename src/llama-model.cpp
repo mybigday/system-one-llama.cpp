@@ -330,6 +330,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3next(params);
         case LLM_ARCH_QWEN35:
             return new llama_model_qwen35(params);
+        case LLM_ARCH_KEV:
+            return new llama_model_kev(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_QWEN4EXP:
@@ -2071,6 +2073,7 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_GRANITE_HYBRID ||
                 arch == LLM_ARCH_QWEN3NEXT ||
                 arch == LLM_ARCH_QWEN35 ||
+                arch == LLM_ARCH_KEV ||
                 arch == LLM_ARCH_QWEN35MOE ||
                 arch == LLM_ARCH_NEMOTRON_H ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3076,6 +3079,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_KEV:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN3TTS:

@@ -313,6 +313,7 @@ class Keys:
         QTYPE_TOKEN_INDEX       = "{arch}.decision_head.qtype_token_index"
         CALIBRATION_TEMPERATURE = "{arch}.decision_head.calibration_temperature"
         SLOT_TOKEN_ID           = "{arch}.decision_head.slot_token_id"
+        POINTER_DIM             = "{arch}.decision_head.pointer_dim"
 
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"

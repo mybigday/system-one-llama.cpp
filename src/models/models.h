@@ -2576,6 +2576,23 @@ struct llama_model_qwen4exp : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// kev (github.com/jaredpalmer/kev) is Qwen3.5 plus a pointer head: the backbone is unchanged,
+// so the graph is qwen35's with two pointwise projections appended. Nothing about the head
+// needs the backbone's internals, which is why this subclasses the graph instead of copying it.
+struct llama_model_kev : public llama_model_qwen35 {
+    llama_model_kev(const struct llama_model_params & params) : llama_model_qwen35(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llama_model_qwen35::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

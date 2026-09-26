@@ -1016,6 +1016,9 @@ class GGUFWriter:
     def add_decision_head_slot_token_id(self, value: int) -> None:
         self.add_uint32(Keys.DecisionHead.SLOT_TOKEN_ID.format(arch=self.arch), value)
 
+    def add_decision_head_pointer_dim(self, value: int) -> None:
+        self.add_uint32(Keys.DecisionHead.POINTER_DIM.format(arch=self.arch), value)
+
     def add_decision_head_calibration_temperature(self, value: Sequence[float]) -> None:
         self.add_array(Keys.DecisionHead.CALIBRATION_TEMPERATURE.format(arch=self.arch), value)
 
