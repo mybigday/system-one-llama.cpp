@@ -166,6 +166,12 @@ struct server_task {
         // distribution over letters, so the numbers come back as scores for the route to group.
         bool scored = false;
 
+        // A pointer readout reads a whole output row at each slot instead of its first number,
+        // because the answer is a dot product of two of them. Non-zero is the row's width, and
+        // then `slots` carries the query position as its last entry: to the batch it is one more
+        // position to mark, and only the route knows it means something different.
+        int pointer_width = 0;
+
         // a bidirectional readout cannot reuse a cached prefix: every position attends to
         // every other, so a changed tail changes the representation of the head too
         // how far a reused prompt prefix may extend into this sequence; the library works it

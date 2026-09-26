@@ -2232,9 +2232,10 @@ private:
 
         const size_t n_slots = slot.task->system_one.slots.size();
         const bool   scored  = slot.task->system_one.scored;
+        const size_t width   = std::max(1, slot.task->system_one.pointer_width);
         for (size_t qi = 0; qi < n_slots; qi++) {
             const bool missing = scored
-                ? (qi >= slot.so_scores.size()  || std::isnan(slot.so_scores[qi]))
+                ? (qi * width >= slot.so_scores.size()  || std::isnan(slot.so_scores[qi * width]))
                 : (qi >= slot.so_answers.size() || slot.so_answers[qi].probs.empty());
             if (missing) {
                 SLT_ERR(slot, "nothing collected for answer slot %zu\n", qi);
@@ -3929,7 +3930,25 @@ private:
             // i_batch guard below (which only tracks the last prompt token)
             if (slot.task && slot.task->type == SERVER_TASK_TYPE_SYSTEM_ONE && !slot.so_outputs.empty()) {
                 const auto & so = slot.task->system_one;
-                if (so.scored) {
+                if (so.pointer_width > 0) {
+                    // the whole output row at each marked position, laid out slot by slot: the
+                    // answer is a dot product of two of them, so neither is a number on its own
+                    const size_t w = (size_t) so.pointer_width;
+                    if (slot.so_scores.size() != so.slots.size() * w) {
+                        slot.so_scores.assign(so.slots.size() * w, std::numeric_limits<float>::quiet_NaN());
+                    }
+                    for (const auto & [idx, qi] : slot.so_outputs) {
+                        if (!is_inside_view(idx) || !std::isnan(slot.so_scores[qi * w])) {
+                            continue;
+                        }
+                        const float * row = llama_get_embeddings_ith(ctx_tgt, idx - off);
+                        if (row == nullptr) {
+                            SLT_ERR(slot, "failed to get the output row for answer slot %d\n", idx);
+                            continue;
+                        }
+                        std::copy(row, row + w, slot.so_scores.begin() + qi * w);
+                    }
+                } else if (so.scored) {
                     // one number per slot, read where the model put it; the route groups them
                     if (slot.so_scores.size() != so.slots.size()) {
                         slot.so_scores.assign(so.slots.size(), std::numeric_limits<float>::quiet_NaN());
@@ -5675,10 +5694,24 @@ const json & st = body.at("state");
             }
 
             answers = system_one_answers_from_scores(plan, scores);
-        } else if (plan.scored_slots) {
-            // The model scores positions, and the format asks one question per sequence, so this
-            // is one task per question -- each reading its options' numbers out of the model's
-            // own head rather than a distribution over letters.
+        } else if (plan.scored_slots || plan.kev_pointer) {
+            // A pointer sequence hands back whole output rows, concatenated; this is where they
+            // are read back as rows again, and it is the only place their width matters.
+            const int n_embd_out = llama_model_n_embd_out(ctx_server.model_tgt);
+            const auto rows_of = [](const std::vector<float> & flat, int w) {
+                std::vector<const float *> rows;
+                rows.reserve(w > 0 ? flat.size() / (size_t) w : 0);
+                for (size_t at = 0; w > 0 && at + (size_t) w <= flat.size(); at += (size_t) w) {
+                    rows.push_back(flat.data() + at);
+                }
+                return rows;
+            };
+
+            // The model answers at positions, and the format asks one question per sequence, so
+            // this is one task per question -- each reading its options out of the model's own
+            // head rather than as a distribution over letters. A pointer readout differs only in
+            // what is read at a position: a whole output row instead of its first number, and one
+            // position more, for the query the options are scored against.
             if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_NONE) {
                 res->error(format_error_response(
                     "this model answers with one number per position; start the server with "
@@ -5706,6 +5739,12 @@ const json & st = body.at("state");
                     task.index  = i;
                     task.tokens = server_tokens(seq.tok.ids, false);
                     task.system_one.slots      = seq.tok.slots;
+                    if (plan.kev_pointer) {
+                        // the query is one more position to mark; that it is the query rather
+                        // than an option is the route's business, not the batch's
+                        task.system_one.slots.push_back(seq.tok.query);
+                        task.system_one.pointer_width = n_embd_out;
+                    }
                     task.system_one.n_options  = { plan.n_options[seq.question] };
                     task.system_one.scored     = true;
                     task.system_one.n_reusable = seq.n_reusable;
@@ -5734,7 +5773,9 @@ const json & st = body.at("state");
                 scores.insert(scores.end(), one.begin(), one.end());
             }
 
-            answers = system_one_answers_from_scores(plan, scores);
+            answers = plan.kev_pointer
+                    ? system_one_answers_from_kev_pointer(plan, rows_of(scores, n_embd_out), n_embd_out)
+                    : system_one_answers_from_scores(plan, scores);
         } else {
             // One sequence, one decode, the answers read at the slots the plan marked.
             const auto & seq = plan.sequences.front();
