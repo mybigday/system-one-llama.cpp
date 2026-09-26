@@ -136,6 +136,51 @@ static std::vector<system_one_answer> decode_scored(llama_context * ctx, const s
     return system_one_answers_from_scores(p, scores);
 }
 
+// kev_pointer: one sequence per question; the model emits a key and a query at every position
+// and the answer is the dot of each option marker's key with the row's query. Only the rows that
+// are read are marked as outputs -- unlike a scored slot, which reads a single float, a pointer
+// row is 2*dp wide and drags the (tied) output projection along with it.
+static std::vector<system_one_answer> decode_pointer(llama_context * ctx, const system_one_plan & p) {
+    const llama_model * model = llama_get_model(ctx);
+    const int n_embd_out = llama_model_n_embd_out(model);
+
+    std::vector<std::vector<float>> held;
+    std::vector<const float *>      rows;
+
+    for (const auto & seq : p.sequences) {
+        const auto & t = seq.tok;
+        if (t.query < 0) { throw std::runtime_error("a pointer sequence has no query position"); }
+
+        reset_memory(ctx);
+        llama_batch b = llama_batch_init((int32_t) t.ids.size(), 0, 1);
+        b.n_tokens = (int32_t) t.ids.size();
+        for (size_t i = 0; i < t.ids.size(); i++) {
+            b.token[i] = t.ids[i]; b.pos[i] = (llama_pos) i;
+            b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 0;
+        }
+        for (int s : t.slots)   { b.logits[s] = 1; }
+        b.logits[t.query] = 1;
+
+        const int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        if (rc != 0) { throw std::runtime_error("decode failed (" + std::to_string(rc) + ")"); }
+
+        // copied out before the next sequence overwrites the context's output buffer
+        for (int s : t.slots) {
+            const float * e = llama_get_embeddings_ith(ctx, s);
+            if (!e) { throw std::runtime_error("no output at an answer marker"); }
+            held.emplace_back(e, e + n_embd_out);
+        }
+        const float * q = llama_get_embeddings_ith(ctx, t.query);
+        if (!q) { throw std::runtime_error("no output at the query position"); }
+        held.emplace_back(q, q + n_embd_out);
+    }
+
+    rows.reserve(held.size());
+    for (const auto & r : held) rows.push_back(r.data());
+    return system_one_answers_from_kev_pointer(p, rows, n_embd_out);
+}
+
 // rank_head: one sequence per option, each pooled to one number by the classification head.
 static std::vector<system_one_answer> decode_ranked(llama_context * ctx, const system_one_plan & p) {
     const uint32_t n_ubatch  = llama_n_ubatch(ctx);
@@ -287,7 +332,8 @@ static int run(int argc, char ** argv) {
         try {
             answers = it.plan.rank_pooling ? decode_ranked(ctx, it.plan)
                     : it.plan.scored_slots ? decode_scored(ctx, it.plan)
-                                           : decode_slots(ctx, it.plan);
+                    : it.plan.kev_pointer ? decode_pointer(ctx, it.plan)
+                                            : decode_slots(ctx, it.plan);
         } catch (const std::exception & e) {
             os << json{{"id", it.id}, {"error", e.what()}}.dump() << "\n";
             continue;

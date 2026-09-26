@@ -36,12 +36,21 @@ enum system_one_kind {
 //   SCORED_SLOT  one sequence per question, with one mask per option, each scored to a single
 //                number by the model's own head -- so the answer is read at K positions of one
 //                sequence rather than as a distribution over labels
+//   KEV_POINTER  one sequence per question, with one marker per option and a query position at
+//                its end; the model emits a key and a query vector at every position, and an
+//                option's logit is the dot of its key with that query. A scored slot in shape,
+//                but the number is not in the output -- it is made from two rows of it.
+//                Named for the checkpoint family rather than the mechanism on purpose: a
+//                pointer-shaped head is not kev's alone (openJev-verdict has one and reads as
+//                SCORED_SLOT, because an encoder can fold the dot into its graph), and this
+//                value also fixes kev's own convention that the query is the row's last token
 //   RANK_HEAD    one sequence per option, scored by the model's classification head -- the
 //                reranker shape, and the only readout that costs K forward passes
 enum system_one_readout {
     SYSTEM_ONE_READOUT_LETTER_SLOT,
     SYSTEM_ONE_READOUT_MASKED_SLOT,
     SYSTEM_ONE_READOUT_SCORED_SLOT,
+    SYSTEM_ONE_READOUT_KEV_POINTER,
     SYSTEM_ONE_READOUT_RANK_HEAD,
 };
 
@@ -78,6 +87,10 @@ struct system_one_params {
     // whether a prefix's KV can be reused: see system_one_sequence::n_reusable.
     bool causal = true;
 
+    // {arch}.decision_head.pointer_dim: half an output row, and what says this model answers
+    // with a pointer rather than with a number per position. Zero on every other checkpoint.
+    int pointer_dim = 0;
+
     llama_token mask_token = -1;    // tokenizer.ggml.mask_token_id
     std::string mask_text;          // its piece, so a template can write it
     std::string bos_text;           // likewise for BOS: the template writes it, as chat
@@ -97,9 +110,14 @@ struct system_one_tokenized {
     std::vector<llama_token> ids;
 
     // Where the answers are read. One per question for a letter or mask slot, where the slot
-    // carries a distribution over the labels; one per *option* for a scored slot, where each
-    // carries a single number and a question's answer is the softmax over its own.
+    // carries a distribution over the labels; one per *option* for a scored or pointer slot,
+    // where a question's answer is the softmax over its own.
     std::vector<int>         slots;
+
+    // kev_pointer only: where the query is read. The last token of the sequence, because that
+    // is where kev puts `<decide>` -- taken from the tokenization rather than assumed, so a
+    // template that ends differently fails here instead of answering from the wrong position.
+    int                      query = -1;
 };
 
 // One sequence the request turns into. A slot readout plans exactly one; a rank_head readout
@@ -142,6 +160,7 @@ struct system_one_plan {
 
     bool rank_pooling  = false;  // sequences are scored by the model's head, not read at a slot
     bool scored_slots  = false;  // every slot is one number, so a question's answer is its K slots
+    bool kev_pointer = false;  // every slot is a key, dotted with the sequence's query row
 };
 
 // Stage one: what the request is, before anything is tokenized.
@@ -207,6 +226,14 @@ std::vector<system_one_answer> system_one_answers_from_logits(const system_one_p
 
 std::vector<system_one_answer> system_one_answers_from_scores(const system_one_plan & p,
                                                               const std::vector<float> & scores);
+
+// kev_pointer: `rows` holds, per planned sequence and in plan order, that sequence's K slot
+// rows followed by its one query row, each `n_embd_out` floats wide. An option's logit is the
+// dot of the first half of its slot row with the second half of the query row -- the scale and
+// the calibration temperature are already in the weights, so there is no constant here.
+std::vector<system_one_answer> system_one_answers_from_kev_pointer(const system_one_plan & p,
+                                                               const std::vector<const float *> & rows,
+                                                               int n_embd_out);
 
 // What the readout requires of a context: a rank_head answer is read from a pooled embedding.
 struct system_one_context_needs {

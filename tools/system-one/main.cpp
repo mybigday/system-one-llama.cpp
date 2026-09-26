@@ -267,6 +267,64 @@ static std::vector<system_one_answer> decode_scored(llama_context * ctx, const s
     return system_one_answers_from_scores(p, scores);
 }
 
+// kev_pointer: one sequence per question, the model emitting a key and a query at every
+// position. An option's logit is the dot of its marker's key with the row's query -- so unlike a
+// scored slot, two positions make one number, and only the rows that are read are asked for.
+static std::vector<system_one_answer> decode_pointer(llama_context * ctx, const system_one_plan & p) {
+    const int n_embd_out = llama_model_n_embd_out(llama_get_model(ctx));
+
+    std::vector<std::vector<float>> held;
+
+    for (const auto & seq : p.sequences) {
+        const auto & t = seq.tok;
+        if (t.query < 0) {
+            throw std::runtime_error("a pointer sequence has no query position");
+        }
+
+        if (auto * mem = llama_get_memory(ctx)) {
+            llama_memory_clear(mem, true);
+        }
+
+        llama_batch batch = llama_batch_init((int32_t) t.ids.size(), 0, 1);
+        batch.n_tokens = (int32_t) t.ids.size();
+        for (size_t i = 0; i < t.ids.size(); i++) {
+            batch.token[i]     = t.ids[i];
+            batch.pos[i]       = (llama_pos) i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = 0;
+        }
+        for (int slot : t.slots) { batch.logits[slot] = 1; }
+        batch.logits[t.query] = 1;
+
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) {
+            throw std::runtime_error("llama_decode failed with " + std::to_string(rc));
+        }
+
+        // copied out now: the next sequence reuses the context's output buffer
+        for (int slot : t.slots) {
+            const float * e = llama_get_embeddings_ith(ctx, slot);
+            if (e == nullptr) {
+                throw std::runtime_error("the model returned nothing at an answer marker");
+            }
+            held.emplace_back(e, e + n_embd_out);
+        }
+        const float * q = llama_get_embeddings_ith(ctx, t.query);
+        if (q == nullptr) {
+            throw std::runtime_error("the model returned nothing at the query position");
+        }
+        held.emplace_back(q, q + n_embd_out);
+    }
+
+    std::vector<const float *> rows;
+    rows.reserve(held.size());
+    for (const auto & r : held) rows.push_back(r.data());
+
+    return system_one_answers_from_kev_pointer(p, rows, n_embd_out);
+}
+
 // rank_head: one sequence per option, scored by the model's head. They are independent, so a
 // chunk of them shares a decode -- bounded by seq_id count, and by the ubatch, since a
 // bidirectional sequence cannot be split across one.
@@ -495,8 +553,9 @@ int main(int argc, char ** argv) {
     std::vector<system_one_answer> answers;
     try {
         answers = plan.rank_pooling ? decode_ranked(ctx, plan)
-                : plan.scored_slots ? decode_scored(ctx, plan)
-                                    : decode_slots(ctx, plan);
+                : plan.scored_slots  ? decode_scored(ctx, plan)
+                : plan.kev_pointer ? decode_pointer(ctx, plan)
+                                     : decode_slots(ctx, plan);
     } catch (const std::exception & e) {
         LOG_ERR("%s: %s\n", __func__, e.what());
         llama_free(ctx); llama_model_free(model);

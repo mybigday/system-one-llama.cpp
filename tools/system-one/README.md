@@ -168,29 +168,56 @@ makes the numbers comparable to the reference implementation at all.
 ## Readouts
 
 Where the answer sits is **derived from what the checkpoint is**, and there is no metadata key
-for it: a model carrying a classification head is read through it, a bidirectional one at a
-mask token, a causal one at the next token. So a checkpoint read the wrong way is a checkpoint
-describing itself wrongly -- almost always `{arch}.attention.causal`, which the graph builds
-its attention mask from too.
+for it: a model carrying a classification head is read through it, one with a pointer head by
+its pointer dimension, a bidirectional one at a mask token, a causal one at the next token. So a
+checkpoint read the wrong way is a checkpoint describing itself wrongly -- almost always
+`{arch}.attention.causal`, which the graph builds its attention mask from too.
 
 | readout | the answer is | cost |
 |---|---|---|
 | `letter_slot` | the next-token distribution at the end of each question's segment | one pass |
 | `masked_slot` | the distribution at a mask token inside it (bidirectional models) | one pass |
 | `scored_slot` | one number per position from the model's own head, read at the positions it marks | one pass **per question** |
+| `kev_pointer` | the dot of a key at each option's marker with a query at the sequence's last position | one pass **per question** |
 | `rank_head` | the model's classification head scoring one sequence per option | K passes |
 
 Only `letter_slot` can reuse a prefix across calls: bidirectional attention makes every
 position depend on what follows it, so changing the tail of a state changes its head.
 
-`scored_slot` needs a server started with `--embeddings --pooling none`, because its answer
-arrives as embeddings rather than logits.
+`scored_slot` and `kev_pointer` need a server started with `--embeddings --pooling none`,
+because their answers arrive as embeddings rather than logits.
+
+`kev_pointer` is the one readout whose number is not in the output: the model emits a key and a
+query vector at **every** position, concatenated, and an option's logit is the dot of its
+marker's key with the query at the sequence's last token. Whatever scale or calibration
+temperature the head carries is folded into its query projection at conversion, so nothing is
+applied at runtime.
+
+**Why the dot is taken here and not in the graph**, since a pointwise graph would have made this
+`scored_slot` and saved a readout: it needs two positions at once, and in a causal row the query
+is the *last* token. A graph that computed it would be correct only while a whole row fitted in
+one micro-batch, and would go quietly wrong on a long state -- numbers, not an error. Emitting
+both vectors is pointwise, so it holds for any split, and what is left is one multiply-accumulate
+the caller does on its own output.
+
+**And why it is named for a checkpoint family rather than for the mechanism.** The mechanism is
+not kev's alone: `openJev-verdict`'s head is the same shape, `dot(text_projector(pooled),
+classes_projector(class_i))` -- a query vector against per-marker keys. That one is `scored_slot`
+here, because it is an encoder: bidirectional, no KV cache, the whole sequence necessarily in one
+micro-batch, so its dot folds into the graph and its output really is one number per position.
+So the line that matters is not "pointer or not" but **whether the dot can live in the graph**,
+and a generic name would claim a family this readout does not cover -- including the other
+pointer-shaped head already in the tree. It also hard-codes kev's own convention that the query
+is the row's last token, where openJev's sits at position 0. If a second causal pointer head ever
+appears, that is the point at which a shared name can be designed, with two examples rather than
+one.
 
 ## Asking several questions at once
 
 This section is about `letter_slot` and `masked_slot`, the two readouts that put every question
-in one prompt. `scored_slot` renders one sequence per question and `rank_head` one per option, so
-for those the question below does not arise -- and neither does the speed argument.
+in one prompt. `scored_slot` and `kev_pointer` render one sequence per question and `rank_head`
+one per option, so for those the question below does not arise -- and neither does the speed
+argument.
 
 All of a request's questions are slots in one prompt, so they are answered by one forward pass:
 five questions about a 214-token ticket cost one decode, and asking them separately re-encodes
@@ -218,7 +245,8 @@ questions) and the more accurate one.
 The last row is the same effect at a fifth the size, and it says where the effect comes from: the
 15-to-22-point version is a *causal* model inducing from its own unanswered slots, which needs a
 privileged left context. A bidirectional model cannot induce that, and keeps only the residual
-from sharing a prompt at all. `scored_slot` and `rank_head` have neither, by construction -- they
+from sharing a prompt at all. `scored_slot`, `kev_pointer` and `rank_head` have neither, by
+construction -- they
 never put two questions in one sequence -- and reproduce their one-pass accuracy exactly.
 
 Distance is not the variable, for either kind of model -- moving a slot from 35 to 716 tokens

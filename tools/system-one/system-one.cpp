@@ -49,6 +49,7 @@ const char * system_one_readout_name(enum system_one_readout readout) {
     switch (readout) {
         case SYSTEM_ONE_READOUT_MASKED_SLOT: return "masked_slot";
         case SYSTEM_ONE_READOUT_SCORED_SLOT: return "scored_slot";
+        case SYSTEM_ONE_READOUT_KEV_POINTER: return "kev_pointer";
         case SYSTEM_ONE_READOUT_RANK_HEAD:   return "rank_head";
         default:                             return "letter_slot";
     }
@@ -98,10 +99,21 @@ system_one_params system_one_params_from_model(const llama_model * model) {
             scores_tokens = meta_str(model, (arch + ".embedding_length_out").c_str(), w) && w == "1";
         }
 
-        out.readout = has_cls_head   ? SYSTEM_ONE_READOUT_RANK_HEAD
-                    : causal         ? SYSTEM_ONE_READOUT_LETTER_SLOT
-                    : scores_tokens  ? SYSTEM_ONE_READOUT_SCORED_SLOT
-                                     : SYSTEM_ONE_READOUT_MASKED_SLOT;
+        // A pointer head is the one case where the output row is neither a distribution nor a
+        // score: it is a key and a query, and the number comes from two rows of it. That is a
+        // property of the head, so it is read from the head's own key -- and it is checked
+        // before causality, because an output row of keys is not a distribution over letters
+        // whichever way the model attends.
+        std::string dim;
+        if (!arch.empty() && meta_str(model, (arch + ".decision_head.pointer_dim").c_str(), dim)) {
+            out.pointer_dim = std::atoi(dim.c_str());
+        }
+
+        out.readout = has_cls_head      ? SYSTEM_ONE_READOUT_RANK_HEAD
+                    : out.pointer_dim>0 ? SYSTEM_ONE_READOUT_KEV_POINTER
+                    : causal            ? SYSTEM_ONE_READOUT_LETTER_SLOT
+                    : scores_tokens     ? SYSTEM_ONE_READOUT_SCORED_SLOT
+                                        : SYSTEM_ONE_READOUT_MASKED_SLOT;
     }
 
     if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
@@ -134,7 +146,8 @@ system_one_params system_one_params_from_model(const llama_model * model) {
         out.eos_text = piece(llama_vocab_eos(vocab));
     }
 
-    if (out.readout == SYSTEM_ONE_READOUT_MASKED_SLOT || out.readout == SYSTEM_ONE_READOUT_SCORED_SLOT) {
+    if (out.readout == SYSTEM_ONE_READOUT_MASKED_SLOT || out.readout == SYSTEM_ONE_READOUT_SCORED_SLOT ||
+        out.readout == SYSTEM_ONE_READOUT_KEV_POINTER) {
         // Which token marks an answer is the architecture's, not the tokenizer's: a masked LM
         // marks with its mask token, a class-token head with its own. The arch says so when it
         // differs, the way laya's question-type ids do.
@@ -345,7 +358,7 @@ system_one_tokenized system_one_tokenize_segments(const llama_vocab * vocab,
 
     // A scored slot is found by its mask rather than by where the segment ends, so this readout
     // does not need the question block to come last -- laya puts the state after it.
-    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT) {
+    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT || cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER) {
         for (size_t i = 0; i < segments.size(); i++) {
             const auto ids = common_tokenize(vocab, segments[i], false, true);
             if (ids.empty()) {
@@ -361,6 +374,16 @@ system_one_tokenized system_one_tokenize_segments(const llama_vocab * vocab,
         if (out.slots.empty()) {
             throw std::invalid_argument("no mask token (" + std::to_string(cfg.mask_token) +
                   ") in the sequence: a scored slot is read at one");
+        }
+        if (cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER) {
+            // kev's <decide> ends the row, and the query is read there. Taking the last position
+            // rather than searching for the token means a template is free to spell it however
+            // the checkpoint does -- but it must still put it last, and this is what says so.
+            out.query = (int) out.ids.size() - 1;
+            if (!out.slots.empty() && out.slots.back() >= out.query) {
+                throw std::invalid_argument("the last answer marker is at or after the end of the "
+                      "sequence: a pointer readout needs its query position after every option");
+            }
         }
         return out;
     }
@@ -453,10 +476,11 @@ system_one_plan system_one_build_plan(const system_one_params & cfg,
         return out;
     }
 
-    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT) {
+    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT || cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER) {
         // the head scores positions, not sequences, but the format still asks one question at a
         // time: every mask in the sequence is one of that question's options
-        out.scored_slots = true;
+        out.scored_slots  = cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT;
+        out.kev_pointer = cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER;
 
         for (size_t qi = 0; qi < qs.size(); qi++) {
             const std::vector<system_one_question> one(qs.begin() + qi, qs.begin() + qi + 1);
@@ -599,6 +623,61 @@ std::vector<system_one_answer> system_one_answers_from_scores(const system_one_p
     return out;
 }
 
+std::vector<system_one_answer> system_one_answers_from_kev_pointer(const system_one_plan & p,
+                                                               const std::vector<const float *> & rows,
+                                                               int n_embd_out) {
+    if (!p.kev_pointer) {
+        throw std::runtime_error("this plan is not a pointer readout");
+    }
+    if (n_embd_out <= 0 || n_embd_out % 2 != 0) {
+        throw std::runtime_error("a pointer row is a key followed by a query, so its width must "
+              "be even; got " + std::to_string(n_embd_out));
+    }
+    const int dp = n_embd_out / 2;
+
+    size_t need = 0;
+    for (const auto & seq : p.sequences) need += seq.tok.slots.size() + 1;
+    if (rows.size() != need) {
+        throw std::runtime_error("expected " + std::to_string(need) + " rows (one per option "
+              "plus one query per sequence), got " + std::to_string(rows.size()));
+    }
+
+    std::vector<system_one_answer> out(p.n_options.size(), system_one_answer());
+    std::vector<std::vector<float>> per_question(p.n_options.size());
+
+    size_t at = 0;
+    for (const auto & seq : p.sequences) {
+        if (seq.question >= per_question.size()) {
+            throw std::runtime_error("a planned sequence refers to a question that is not in the request");
+        }
+        const size_t k = seq.tok.slots.size();
+        const float * query = rows[at + k];   // the query row follows this sequence's slots
+        if (!query) {
+            throw std::runtime_error("a sequence's query position was never read");
+        }
+        for (size_t j = 0; j < k; j++) {
+            const float * key = rows[at + j];
+            if (!key) {
+                throw std::runtime_error("an answer marker was never read");
+            }
+            // the key half of the option's row against the query half of the query's row; the
+            // scale and the calibration temperature were folded into the weights at conversion
+            float z = 0.0f;
+            for (int d = 0; d < dp; d++) z += key[d] * query[dp + d];
+            per_question[seq.question].push_back(z);
+        }
+        at += k + 1;
+    }
+
+    for (size_t qi = 0; qi < per_question.size(); qi++) {
+        if ((int) per_question[qi].size() != p.n_options[qi]) {
+            throw std::runtime_error("a question did not get one key per option");
+        }
+        out[qi] = system_one_answer_from_scores(per_question[qi]);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- readout
 
 static std::vector<float> softmax(const std::vector<float> & x) {
@@ -668,8 +747,8 @@ system_one_context_needs system_one_required_context(const system_one_params & c
         need.pooling_type = LLAMA_POOLING_TYPE_RANK;
     }
 
-    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT) {
-        // the number is the model's output at each marked position, so nothing is pooled
+    if (cfg.readout == SYSTEM_ONE_READOUT_SCORED_SLOT || cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER) {
+        // the number is made from the model's output at named positions, so nothing is pooled
         need.embeddings   = true;
         need.pooling_type = LLAMA_POOLING_TYPE_NONE;
     }
