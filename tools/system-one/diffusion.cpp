@@ -21,6 +21,9 @@
 //   --mode prefill   PREFILL the prompt, DECODE the canvas (default; the cached path)
 //   --mode unified   one [prompt | canvas] batch, which is only correct when the canvas is
 //                    exactly canvas_length tokens -- so it always is here
+//   --requests F     answer a JSONL of requests instead of scoring a golden, and write the answers
+//                    as JSONL to --out. Same contract as llama-system-one-batch, so the evaluation
+//                    suite can drive this arch through the same path as every other one.
 //   --dump-ids PFX   write PFX.prompt.i32 and PFX.canvas.i32 (raw little-endian int32) for the
 //                    first item, which is what llama-diffusion-gemma-eval takes -- so the same
 //                    layout can be run through the arch's own harness, DG_CACHED=0 and 1.
@@ -49,6 +52,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -58,7 +62,13 @@
 #include <thread>
 #include <vector>
 
-using json = nlohmann::json;
+// ordered_json: the request's key order is part of the question (see batch.cpp)
+using json = nlohmann::ordered_json;
+using clk  = std::chrono::steady_clock;
+
+static double ms_since(clk::time_point t0) {
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+}
 
 enum pkv_phase { PKV_UNIFIED = 0, PKV_PREFILL = 1, PKV_DECODE = 2 };
 
@@ -208,19 +218,25 @@ static int run(int argc, char ** argv) {
                         "[--threads N] [--mode prefill|unified|both] [--ngl N] [--dump out.json]\n", argv[0]);
         return 1;
     }
-    const std::string model_path  = argv[1];
-    const std::string golden_path = argv[2];
+    const std::string model_path = argv[1];
+    std::string golden_path;   // positional, and only needed when scoring rather than answering
 
     int         limit = -1, ngl = 0;
     int         nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
     std::string mode = "prefill", tmpl_path, dump_path, ids_prefix, marker = "<|canvas|>";
+    std::string req_path, out_path;
     bool dry_run = false, control = false, pad = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) { dry_run = true; }
         if (strcmp(argv[i], "--pad")     == 0) { pad     = true; }
         if (strcmp(argv[i], "--control") == 0) { control = true; }
     }
-    for (int i = 3; i + 1 < argc; i++) {
+    for (int i = 2; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            if (golden_path.empty()) { golden_path = argv[i]; }
+            continue;
+        }
+        if (i + 1 >= argc) { break; }
         if      (strcmp(argv[i], "--limit")         == 0) limit     = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threads")       == 0) nthreads  = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ngl")           == 0) ngl       = atoi(argv[++i]);
@@ -229,18 +245,73 @@ static int run(int argc, char ** argv) {
         else if (strcmp(argv[i], "--dump")          == 0) dump_path = argv[++i];
         else if (strcmp(argv[i], "--canvas-marker") == 0) marker    = argv[++i];
         else if (strcmp(argv[i], "--dump-ids")      == 0) ids_prefix = argv[++i];
+        else if (strcmp(argv[i], "--requests")      == 0) req_path   = argv[++i];
+        else if (strcmp(argv[i], "--out")           == 0) out_path   = argv[++i];
     }
     if (mode != "prefill") {
         pad = true;   // UNIFIED splits on the hparam, so it has no choice
+    }
+    if (req_path.empty() && golden_path.empty()) {
+        fprintf(stderr, "pass a golden to score, or --requests FILE to answer\n");
+        return 1;
     }
     if (mode != "prefill" && mode != "unified" && mode != "both") {
         fprintf(stderr, "--mode must be prefill, unified or both\n");
         return 1;
     }
 
-    json g;
-    { std::ifstream f(golden_path); if (!f) { fprintf(stderr, "cannot open %s\n", golden_path.c_str()); return 1; } f >> g; }
-    auto items = g.at("items");
+    // A request and a golden item hold the same thing in different clothes, so the wire format is
+    // reshaped into the item the loop below already walks and only the output differs.
+    json items = json::array();
+    std::vector<json>                     req_ids;
+    std::vector<std::vector<std::string>> req_keys;
+    const bool answering = !req_path.empty();
+
+    if (answering) {
+        std::ifstream f(req_path);
+        if (!f) { fprintf(stderr, "cannot open %s\n", req_path.c_str()); return 1; }
+        std::string line;
+        size_t n = 0;
+        while (std::getline(f, line)) {
+            if (line.empty()) { continue; }
+            const json r = json::parse(line);
+            req_ids.push_back(r.contains("id") ? r.at("id") : json((int64_t) n));
+            json item = { {"state", r.at("state").is_string() ? r.at("state").get<std::string>()
+                                                              : r.at("state").dump()},
+                          {"questions", json::array()} };
+            std::vector<std::string> keys;
+            for (const auto & e : r.at("questions").items()) {
+                const json & q = e.value();
+                const std::string kind = q.at("type").get<std::string>();
+                json out = { {"kind", kind}, {"text", q.value("instructions", std::string())} };
+                json opts = json::array(), descs = json::array();
+                if (kind == "noul") {
+                    opts = json::array({"no", "yes"});
+                } else if (q.contains("criteria") && q.at("criteria").is_object()) {
+                    for (const auto & c : q.at("criteria").items()) {
+                        opts.push_back(c.key());
+                        descs.push_back(c.value().is_string() ? c.value().get<std::string>() : "");
+                    }
+                } else if (q.contains("criteria")) {
+                    for (const auto & v : q.at("criteria")) { opts.push_back(v); descs.push_back(""); }
+                }
+                out["options"] = opts;
+                if (!descs.empty()) { out["descs"] = descs; }
+                item["questions"].push_back(out);
+                keys.push_back(e.key());
+            }
+            req_keys.push_back(std::move(keys));
+            items.push_back(std::move(item));
+            n++;
+        }
+        if (items.empty()) { fprintf(stderr, "%s holds no requests\n", req_path.c_str()); return 1; }
+    } else {
+        json g;
+        std::ifstream f(golden_path);
+        if (!f) { fprintf(stderr, "cannot open %s\n", golden_path.c_str()); return 1; }
+        f >> g;
+        items = g.at("items");
+    }
     if (limit > 0 && (int) items.size() > limit) { items.erase(items.begin() + limit, items.end()); }
 
     llama_backend_init();
@@ -298,6 +369,13 @@ static int run(int argc, char ** argv) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const std::vector<llama_token> label_ids =
         system_one_label_tokens(vocab, cfg.labels, cfg.labels_are_default);
+
+    std::ofstream answers_out;
+    if (answering) {
+        if (out_path.empty()) { fprintf(stderr, "--requests needs --out\n"); return 1; }
+        answers_out.open(out_path);
+        if (!answers_out) { fprintf(stderr, "cannot write %s\n", out_path.c_str()); return 1; }
+    }
 
     printf("model: %s\ncanvas_length: %d   mode: %s   threads: %d   marker: %s\n",
            model_path.c_str(), canvas_length, mode.c_str(), nthreads, marker.c_str());
@@ -359,6 +437,7 @@ static int run(int argc, char ** argv) {
             continue;
         }
 
+        const auto t_req = clk::now();
         std::vector<std::vector<float>> rows;
         if (mode == "unified") {
             rows = run_unified(ctx, model, L, n_vocab);
@@ -398,6 +477,40 @@ static int run(int argc, char ** argv) {
                     n_mode_argmax_same += a.choice == b.choice;
                 }
             }
+        }
+
+        if (answering) {
+            json ja;
+            for (size_t qi = 0; qi < qs.size(); qi++) {
+                const auto a = system_one_answer_from_logits(rows[qi].data(), label_ids,
+                                                            (int) qs[qi].options.size());
+                json one;
+                switch (qs[qi].kind) {
+                    case SYSTEM_ONE_KIND_NOUL:
+                        one["noul"] = a.probs.size() > 1 ? a.probs[1] : 0.0f;
+                        break;
+                    case SYSTEM_ONE_KIND_CHOICE: {
+                        one["choice"] = qs[qi].options[a.choice];
+                        json pr;
+                        for (size_t o = 0; o < qs[qi].options.size(); o++) {
+                            pr[qs[qi].options[o]] = a.probs[o];
+                        }
+                        one["probabilities"] = pr;
+                        break;
+                    }
+                    case SYSTEM_ONE_KIND_SCORE:
+                        one["score"] = system_one_score_expectation(a);
+                        one["probabilities"] = a.probs;
+                        break;
+                }
+                one["confidence"] = a.confidence;
+                one["logits"]     = a.logits;
+                ja[req_keys[it][qi]] = one;
+            }
+            answers_out << json{{"id", req_ids[it]}, {"answers", ja}, {"ms", ms_since(t_req)},
+                                {"n_tokens", (int) (L.prompt.size() + L.canvas.size())},
+                                {"n_sequences", 1}}.dump() << "\n";
+            continue;
         }
 
         json ditem = { {"item", it}, {"n_prompt", L.prompt.size()}, {"n_canvas_used", L.n_canvas_used},
