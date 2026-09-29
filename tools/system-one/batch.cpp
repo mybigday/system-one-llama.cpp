@@ -13,6 +13,14 @@
 //
 // usage: llama-system-one-batch <model.gguf> <requests.jsonl>
 //        [--out FILE] [--template-file F] [--threads N] [--ngl N] [--labels A,B,C]
+//        [--cpu-only] [--fa on|off] [--kv f32|f16] [--ubatch N]
+//
+// The defaults (kv f32, flash-attn off) are the parity conditions. --cpu-only offers no device
+// and turns op offload off: a build with an accelerator registered sends large matmuls to it
+// even at --ngl 0, so that alone does not measure the CPU. --ubatch caps the micro-batch of a
+// causal readout (letter_slot, kev_pointer); a bidirectional sequence must stay in one, so the
+// others ignore it. An accelerator with a per-buffer ceiling (Hexagon: ~1 GB) needs it for long
+// prompts, because the compute buffer scales with the micro-batch.
 //
 // A request line is the body /v1/systemone takes, plus an optional "id":
 //   {"id": "s0.q3", "state": "...", "questions": {"k": {"type":"noul","instructions":"..."}}}
@@ -242,12 +250,22 @@ static int run(int argc, char ** argv) {
     const std::string model_path = argv[1], req_path = argv[2];
     std::string out_path, tmpl_path, labels_csv;
     int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2), ngl = 0;
+    bool cpu_only = false, fa = false;
+    ggml_type kv_type = GGML_TYPE_F32;
+    int ubatch = 0;
     for (int i = 3; i + 1 < argc; i++) {
         if      (strcmp(argv[i], "--out")           == 0) out_path   = argv[++i];
         else if (strcmp(argv[i], "--template-file") == 0) tmpl_path  = argv[++i];
         else if (strcmp(argv[i], "--threads")       == 0) nthreads   = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ngl")           == 0) ngl        = atoi(argv[++i]);
         else if (strcmp(argv[i], "--labels")        == 0) labels_csv = argv[++i];
+        else if (strcmp(argv[i], "--ubatch")        == 0) ubatch     = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fa")            == 0) fa         = strcmp(argv[++i], "on") == 0;
+        else if (strcmp(argv[i], "--kv")            == 0) kv_type    = strcmp(argv[++i], "f16") == 0
+                                                                     ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    }
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--cpu-only") == 0) { cpu_only = true; }
     }
 
     std::vector<json> reqs;
@@ -264,8 +282,12 @@ static int run(int argc, char ** argv) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    ggml_backend_dev_t no_devices[] = { nullptr };
+    if (cpu_only) { mp.devices = no_devices; mp.n_gpu_layers = 0; }
+    const auto t_load = clk::now();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { fprintf(stderr, "failed to load %s\n", model_path.c_str()); return 1; }
+    const double load_ms = ms_since(t_load);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     system_one_params cfg = system_one_params_from_model(model);
@@ -317,6 +339,9 @@ static int run(int argc, char ** argv) {
     cp.n_ctx           = (uint32_t) std::max<size_t>(max_tok + 64, 512);
     cp.n_batch         = cp.n_ctx;
     cp.n_ubatch        = cp.n_ctx;
+    const bool causal  = cfg.readout == SYSTEM_ONE_READOUT_LETTER_SLOT ||
+                         cfg.readout == SYSTEM_ONE_READOUT_KEV_POINTER;
+    if (causal && ubatch > 0) { cp.n_ubatch = std::min<uint32_t>(cp.n_ctx, ubatch); }
     // Only rank_head puts several sequences in one decode. The other readouts run one at a
     // time and clear the memory in between, and asking for more costs context rather than
     // buying anything: with a non-unified cache each sequence gets `n_ctx / n_seq_max`
@@ -329,17 +354,22 @@ static int run(int argc, char ** argv) {
     cp.n_threads_batch = nthreads;
     cp.embeddings      = need.embeddings;
     cp.pooling_type    = need.pooling_type;
-    cp.type_k = cp.type_v = GGML_TYPE_F32;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.type_k = cp.type_v = kv_type;
+    cp.flash_attn_type = fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.op_offload      = !cpu_only;
+    const auto t_ctx = clk::now();
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create a context\n"); return 1; }
+    const double ctx_ms = ms_since(t_ctx);
 
     std::ofstream out;
     if (!out_path.empty()) { out.open(out_path); }
     std::ostream & os = out_path.empty() ? std::cout : out;
 
-    fprintf(stderr, "%zu requests, ctx %u, n_seq_max %u, readout %s, threads %d, ngl %d\n",
-            items.size(), cp.n_ctx, cp.n_seq_max, system_one_readout_name(cfg.readout), nthreads, ngl);
+    fprintf(stderr, "%zu requests, ctx %u, n_seq_max %u, readout %s, threads %d, ngl %d, "
+                    "ubatch %u, cpu_only %d, fa %s, kv %s, load %.0f ms, context %.0f ms\n",
+            items.size(), cp.n_ctx, cp.n_seq_max, system_one_readout_name(cfg.readout), nthreads,
+            mp.n_gpu_layers, cp.n_ubatch, cpu_only, fa ? "on" : "off", ggml_type_name(kv_type), load_ms, ctx_ms);
 
     for (auto & it : items) {
         reset_memory(ctx);
