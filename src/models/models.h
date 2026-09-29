@@ -2593,6 +2593,22 @@ struct llama_model_kev : public llama_model_qwen35 {
 };
 
 
+// the same head on a Qwen3 backbone: jaredpalmer/kev-0.6b is Qwen/Qwen3-0.6B-Base, while the
+// 0.8b and larger checkpoints are Qwen3.5
+struct llama_model_kev_qwen3 : public llama_model_qwen3 {
+    llama_model_kev_qwen3(const struct llama_model_params & params) : llama_model_qwen3(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llama_model_qwen3::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

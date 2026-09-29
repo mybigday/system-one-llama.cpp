@@ -332,6 +332,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35(params);
         case LLM_ARCH_KEV:
             return new llama_model_kev(params);
+        case LLM_ARCH_KEV_QWEN3:
+            return new llama_model_kev_qwen3(params);
         case LLM_ARCH_QWEN35MOE:
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_QWEN4EXP:
@@ -3006,6 +3008,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DREAM:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_KEV_QWEN3:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:

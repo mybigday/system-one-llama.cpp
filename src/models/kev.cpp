@@ -69,3 +69,54 @@ llama_model_kev::graph::graph(const llama_model & model, const llm_graph_params 
     res->t_embd = cur;
     ggml_build_forward_expand(gf, cur);
 }
+
+// kev on a Qwen3 backbone (jaredpalmer/kev-0.6b is Qwen/Qwen3-0.6B-Base). The head, the fold and
+// the output layout are the ones above; only the class the backbone comes from differs, and the
+// Qwen3 graph leaves `t_embd` at the same place -- post output_norm, narrowed to the output rows.
+
+void llama_model_kev_qwen3::load_arch_hparams(llama_model_loader & ml) {
+    llama_model_qwen3::load_arch_hparams(ml);
+
+    ml.get_key(LLM_KV_DECISION_HEAD_POINTER_DIM, hparams.n_pointer_dim);
+
+    if (hparams.n_pointer_dim == 0) {
+        throw std::runtime_error("kev: decision_head.pointer_dim must be non-zero");
+    }
+
+    hparams.n_embd_out_impl = 2 * hparams.n_pointer_dim;
+}
+
+void llama_model_kev_qwen3::load_arch_tensors(llama_model_loader & ml) {
+    llama_model_qwen3::load_arch_tensors(ml);
+
+    LLAMA_LOAD_LOCALS;
+
+    const int64_t n_dp = hparams.n_pointer_dim;
+
+    pointer_q   = create_tensor(tn(LLM_TENSOR_POINTER_Q, "weight"), {n_embd, n_dp}, 0);
+    pointer_q_b = create_tensor(tn(LLM_TENSOR_POINTER_Q, "bias"),   {n_dp},         0);
+    pointer_k   = create_tensor(tn(LLM_TENSOR_POINTER_K, "weight"), {n_embd, n_dp}, 0);
+    pointer_k_b = create_tensor(tn(LLM_TENSOR_POINTER_K, "bias"),   {n_dp},         0);
+}
+
+std::unique_ptr<llm_graph_context> llama_model_kev_qwen3::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(*this, params);
+}
+
+llama_model_kev_qwen3::graph::graph(const llama_model & model, const llm_graph_params & params)
+    : llama_model_qwen3::graph(model, params) {
+    ggml_tensor * h = res->t_embd;
+    GGML_ASSERT(h && "kev: the backbone graph produced no hidden state to score");
+
+    ggml_tensor * k = ggml_add(ctx0, build_lora_mm(model.pointer_k, h, nullptr), model.pointer_k_b);
+    cb(k, "pointer_k", -1);
+
+    ggml_tensor * q = ggml_add(ctx0, build_lora_mm(model.pointer_q, h, nullptr), model.pointer_q_b);
+    cb(q, "pointer_q", -1);
+
+    ggml_tensor * cur = ggml_concat(ctx0, k, q, 0);
+    cb(cur, "pointer_out", -1);
+
+    res->t_embd = cur;
+    ggml_build_forward_expand(gf, cur);
+}
