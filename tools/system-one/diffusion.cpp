@@ -283,7 +283,7 @@ static int run(int argc, char ** argv) {
             for (const auto & e : r.at("questions").items()) {
                 const json & q = e.value();
                 const std::string kind = q.at("type").get<std::string>();
-                json out = { {"kind", kind}, {"text", q.value("instructions", std::string())} };
+                json out = { {"key", e.key()}, {"kind", kind}, {"text", q.value("instructions", std::string())} };
                 json opts = json::array(), descs = json::array();
                 if (kind == "noul") {
                     opts = json::array({"no", "yes"});
@@ -391,6 +391,7 @@ static int run(int argc, char ** argv) {
         std::vector<system_one_question> qs;
         for (const auto & q : item.at("questions")) {
             system_one_question sq;
+            sq.key  = q.value("key", std::string());
             sq.kind = kind_of(q.at("kind").get<std::string>());
             sq.text = q.at("text").get<std::string>();
             sq.options = q.at("options").get<std::vector<std::string>>();

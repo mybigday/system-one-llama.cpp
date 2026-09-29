@@ -130,6 +130,7 @@ static bool collect_questions(const common_params & params,
 
             const std::string type = q.value("type", "noul");
             system_one_question out;
+            out.key = item.key();
             out.text = q.value("instructions", "");
             if (type == "noul") {
                 out.kind = SYSTEM_ONE_KIND_NOUL;
@@ -173,6 +174,7 @@ static bool collect_questions(const common_params & params,
         }
 
         system_one_question q;
+        q.key  = key;
         q.text = instr;
         if (kind == "noul") {
             q.kind = SYSTEM_ONE_KIND_NOUL;

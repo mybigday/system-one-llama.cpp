@@ -5539,6 +5539,7 @@ const json & st = body.at("state");
 
             const std::string type = json_value(q, "type", std::string("noul"));
             system_one_question out;
+            out.key  = key;
             out.text = json_value(q, "instructions", std::string());
 
             if (type == "noul") {

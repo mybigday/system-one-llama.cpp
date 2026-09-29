@@ -322,6 +322,7 @@ static int run(int argc, char ** argv) {
         for (const auto & e : reqs[i].at("questions").items()) {
             system_one_question q;
             parse_question(e.value(), q);
+            q.key = e.key();
             it.keys.push_back(e.key());
             it.qs.push_back(std::move(q));
         }

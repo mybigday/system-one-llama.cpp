@@ -242,6 +242,7 @@ std::vector<std::string> system_one_render_segments(const system_one_params & cf
         }
         questions.push_back(json{
             {"k",       (int) i + 1},          // 1-based, as templates count questions
+            {"key",     q.key},                // what the caller called it; "" when unnamed
             {"kind",    kind_name(q.kind)},
             {"text",    q.text},
             {"options", options},
@@ -461,7 +462,8 @@ system_one_plan system_one_build_plan(const system_one_params & cfg,
         // reports sum(i/8 * p_i)); that is a score question the caller maps, not a noul, and
         // guessing which of K probabilities is "true" is how the front ends came to disagree.
         if (q.kind == SYSTEM_ONE_KIND_NOUL && q.options.size() != 2) {
-            throw std::invalid_argument("a noul question has exactly two sides, but one declares " +
+            throw std::invalid_argument("a noul question has exactly two sides, but " +
+                (q.key.empty() ? std::string("one") : "\"" + q.key + "\"") + " declares " +
                 std::to_string(q.options.size()) +
                 "; ask it as a score over ordered levels and map the expectation yourself");
         }

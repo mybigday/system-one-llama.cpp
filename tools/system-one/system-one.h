@@ -58,6 +58,11 @@ const char * system_one_readout_name(enum system_one_readout readout);
 
 struct system_one_question {
     enum system_one_kind     kind = SYSTEM_ONE_KIND_NOUL;
+    // The name the caller gave this question. Jev's own contract says the id is for code and is
+    // not sent to the model, and no format here used it -- but internlm/Intern-Decision writes it
+    // into both the decision schema and the JSON answer skeleton it reads the slots from, so the
+    // template layer has to be able to see it. Empty when the caller names nothing.
+    std::string              key;
     std::string              text;
     std::vector<std::string> options;   // noul: {"no","yes"}; score: levels in order
     std::vector<std::string> descs;     // empty, or one per option
