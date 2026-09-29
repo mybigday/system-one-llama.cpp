@@ -456,6 +456,15 @@ system_one_plan system_one_build_plan(const system_one_params & cfg,
         if (q.options.size() < 2) {
             throw std::invalid_argument("every question needs at least two options");
         }
+        // A noul is P(true) over exactly two sides. Some checkpoints ask the same judgement as
+        // a rating scale and collapse it themselves (interfaze-ai/lev reads nine levels and
+        // reports sum(i/8 * p_i)); that is a score question the caller maps, not a noul, and
+        // guessing which of K probabilities is "true" is how the front ends came to disagree.
+        if (q.kind == SYSTEM_ONE_KIND_NOUL && q.options.size() != 2) {
+            throw std::invalid_argument("a noul question has exactly two sides, but one declares " +
+                std::to_string(q.options.size()) +
+                "; ask it as a score over ordered levels and map the expectation yourself");
+        }
         out.n_options.push_back((int) q.options.size());
     }
 

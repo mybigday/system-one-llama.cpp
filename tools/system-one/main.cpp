@@ -580,7 +580,7 @@ int main(int argc, char ** argv) {
         json ja;
         switch (q.kind) {
             case SYSTEM_ONE_KIND_NOUL:
-                ja["noul"] = a.probs.size() > 1 ? a.probs[1] : 0.0f;
+                ja["noul"] = a.probs[1];   // exactly two sides; build_plan refuses anything else
                 break;
             case SYSTEM_ONE_KIND_CHOICE: {
                 ja["choice"] = q.options[a.choice];
@@ -620,7 +620,7 @@ int main(int argc, char ** argv) {
                 q.kind == SYSTEM_ONE_KIND_CHOICE ? "choice" : "score", a.confidence);
             switch (q.kind) {
                 case SYSTEM_ONE_KIND_NOUL:
-                    LOG("  P(true) = %.4f\n", a.probs.size() > 1 ? a.probs[1] : 0.0f);
+                    LOG("  P(true) = %.4f\n", a.probs[1]);   // exactly two sides; build_plan refuses anything else
                     break;
                 case SYSTEM_ONE_KIND_CHOICE:
                     LOG("  -> %s\n", q.options[a.choice].c_str());

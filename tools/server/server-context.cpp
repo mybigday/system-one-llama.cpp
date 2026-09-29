@@ -5822,7 +5822,7 @@ const json & st = body.at("state");
 
             json one = json::object();
             if (kinds[qi] == "noul") {
-                one["noul"] = a.probs.back();          // P(true): the affirmative side is last
+                one["noul"] = a.probs[1];   // exactly two sides; build_plan refuses anything else
             } else if (kinds[qi] == "choice") {
                 json per_option = json::object();
                 for (size_t j = 0; j < options[qi].size(); j++) per_option[options[qi][j]] = a.probs[j];

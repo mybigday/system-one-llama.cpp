@@ -487,7 +487,7 @@ static int run(int argc, char ** argv) {
                 json one;
                 switch (qs[qi].kind) {
                     case SYSTEM_ONE_KIND_NOUL:
-                        one["noul"] = a.probs.size() > 1 ? a.probs[1] : 0.0f;
+                        one["noul"] = a.probs[1];   // exactly two sides; build_plan refuses anything else
                         break;
                     case SYSTEM_ONE_KIND_CHOICE: {
                         one["choice"] = qs[qi].options[a.choice];
