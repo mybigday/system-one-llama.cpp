@@ -1293,7 +1293,14 @@ class GGUFWriter:
         self.add_array(Keys.Tokenizer.PRECOMPILED_CHARSMAP, charsmap)
 
     def add_system_one_labels(self, value: Sequence[str]) -> None:
-        self.add_array(Keys.SystemOne.LABELS, value)
+        # Written as a comma-joined string, not an array, because an array kv cannot be read
+        # back at runtime: llama-model.cpp skips GGUF_TYPE_ARRAY when it builds the metadata
+        # map that llama_model_meta_val_str() serves, so an array here is written and then
+        # silently ignored. A label containing a comma would not survive the round trip.
+        for label in value:
+            if "," in label:
+                raise ValueError(f"answer label {label!r} contains a comma, which separates labels")
+        self.add_string(Keys.SystemOne.LABELS, ",".join(value))
 
     def add_system_one_segment_separator(self, value: str) -> None:
         self.add_string(Keys.SystemOne.SEGMENT_SEPARATOR, value)

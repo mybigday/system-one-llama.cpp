@@ -117,9 +117,9 @@ system_one_params system_one_params_from_model(const llama_model * model) {
     }
 
     if (meta_str(model, "system_one.segment_separator", s) && !s.empty()) out.segment_separator = s;
-    // NOTE: array kv never reach the metadata map -- load_hparams() skips GGUF_TYPE_ARRAY -- so a
-    // checkpoint that sets system_one.labels still gets the default alphabet here. No checkpoint
-    // has set it yet, which is why nothing has noticed.
+    // Written by the converter as a comma-joined string rather than an array: array kv never
+    // reach this map (llama-model.cpp skips GGUF_TYPE_ARRAY when building it), so an array
+    // would be written and then silently ignored. split_array() reads either spelling.
     if (meta_str(model, "system_one.labels", s) && !s.empty()) out.labels = split_array(s);
 
     if (out.labels.empty()) {
