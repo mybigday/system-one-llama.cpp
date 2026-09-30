@@ -13,7 +13,7 @@
 //
 // usage: llama-system-one-batch <model.gguf> <requests.jsonl>
 //        [--out FILE] [--template-file F] [--threads N] [--ngl N] [--labels A,B,C]
-//        [--cpu-only] [--fa on|off] [--kv f32|f16] [--ubatch N]
+//        [--cpu-only] [--fa on|off] [--kv f32|f16|q8_0] [--ubatch N]
 //
 // The defaults (kv f32, flash-attn off) are the parity conditions. --cpu-only offers no device
 // and turns op offload off: a build with an accelerator registered sends large matmuls to it
@@ -261,8 +261,10 @@ static int run(int argc, char ** argv) {
         else if (strcmp(argv[i], "--labels")        == 0) labels_csv = argv[++i];
         else if (strcmp(argv[i], "--ubatch")        == 0) ubatch     = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fa")            == 0) fa         = strcmp(argv[++i], "on") == 0;
-        else if (strcmp(argv[i], "--kv")            == 0) kv_type    = strcmp(argv[++i], "f16") == 0
-                                                                     ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        else if (strcmp(argv[i], "--kv")            == 0) {
+            const char * t = argv[++i];
+            kv_type = strcmp(t, "f16") == 0 ? GGML_TYPE_F16 : strcmp(t, "q8_0") == 0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+        }
     }
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--cpu-only") == 0) { cpu_only = true; }
