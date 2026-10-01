@@ -32,13 +32,21 @@ static bool meta_has(const llama_model * model, const char * key) {
     return llama_model_meta_val_str(model, key, nullptr, 0) >= 0;
 }
 
+// The converter writes system_one.labels as a plain comma-joined string, and a label may
+// legitimately begin with a space: chaoliangUNSW/Jev-Style-Qwen3.5-2B's answer token is " A",
+// because its prompt ends at "Answer:" and ":A" is one token where ":" followed by " A" is two.
+// So spaces are content in that spelling. A bracketed string is what llama.cpp would stringify a
+// kv *array* into -- such a key never reaches the runtime, since arrays are skipped when the
+// metadata map is built, but the spelling is still read, and there the spaces are formatting.
 static std::vector<std::string> split_array(const std::string & s) {
-    // llama.cpp stringifies a kv array as [a, b, c]
+    const bool bracketed = s.size() >= 2 && s.front() == '[' && s.back() == ']';
     std::vector<std::string> out;
-    for (auto & piece : string_split(s, ",")) {
+    for (auto & piece : string_split(bracketed ? s.substr(1, s.size() - 2) : s, ",")) {
         std::string cur;
         for (char c : piece) {
-            if (c != '[' && c != ']' && c != '"' && c != ' ') cur += c;
+            if (c == '"')                continue;
+            if (bracketed && c == ' ')   continue;
+            cur += c;
         }
         if (!cur.empty()) out.push_back(cur);
     }
